@@ -1,0 +1,217 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - '*'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: 3.x
+          
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --find-interpreter
+          sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          manylinux: 2_28
+          before-script-linux: |
+            yum install -y git make gcc pkg-config epel-release nasm clang meson ninja-build
+            git clone --depth 1 https://git.videolan.org/git/ffmpeg/nv-codec-headers.git
+            cd nv-codec-headers
+            make PREFIX=/usr install
+            cd ..
+            
+            git clone --depth 1 https://code.videolan.org/videolan/dav1d.git
+            cd dav1d
+            meson setup build --buildtype release --default-library static --prefix /usr
+            ninja -C build install
+            cd ..
+            
+            export FFMPEG_OUT=/usr
+            export PKG_CONFIG_PATH="/usr/lib/pkgconfig:/usr/lib64/pkgconfig:$PKG_CONFIG_PATH"
+            git clone --depth 1 --branch release/8.1 https://github.com/FFmpeg/FFmpeg.git
+            cd FFmpeg
+            ./configure \
+              --prefix=/usr \
+              --enable-shared \
+              --disable-static \
+              --disable-doc \
+              --disable-programs \
+              --disable-everything \
+              --enable-ffnvcodec \
+              --enable-libdav1d \
+              --enable-decoder=libdav1d \
+              --enable-nvenc \
+              --enable-encoder=av1_nvenc \
+              --enable-parser=av1 \
+              --enable-demuxer=mov \
+              --enable-protocol=file \
+              --enable-protocol=pipe \
+              --extra-cflags="-I$FFMPEG_OUT/include" \
+              --extra-ldflags="-L$FFMPEG_OUT/lib"
+            make -j$(nproc)
+            make install
+            cd ..
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v6
+        with:
+          name: wheels-linux-${{ matrix.target }}
+          path: dist
+
+
+  windows:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        target: [ x64 ]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: 3.x
+          architecture: x64
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git
+            make
+            nasm
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-meson
+            mingw-w64-x86_64-ninja
+            diffutils
+
+      - name: Build FFmpeg (MSYS2)
+        shell: msys2 {0}
+        run: |
+          echo "C:\Program Files\NASM" >> $GITHUB_PATH
+          export FFMPEG_OUT=$(pwd)/ffmpeg-out
+          git clone --depth 1 https://git.videolan.org/git/ffmpeg/nv-codec-headers.git
+          cd nv-codec-headers
+          make PREFIX=$FFMPEG_OUT install
+          cd ..
+          
+          git clone --depth 1 https://code.videolan.org/videolan/dav1d.git
+          cd dav1d
+          meson setup build --buildtype release --default-library static --prefix $FFMPEG_OUT
+          ninja -C build install
+          cd ..
+          
+          export PKG_CONFIG_PATH="$FFMPEG_OUT/lib/pkgconfig"
+          git clone --depth 1 --branch release/8.1 https://github.com/FFmpeg/FFmpeg.git
+          cd FFmpeg
+          ./configure \
+            --prefix=$FFMPEG_OUT \
+            --enable-shared \
+            --disable-static \
+            --disable-doc \
+            --disable-programs \
+            --disable-everything \
+            --enable-ffnvcodec \
+            --enable-libdav1d \
+            --enable-decoder=libdav1d \
+            --enable-nvenc \
+            --enable-encoder=av1_nvenc \
+            --enable-parser=av1 \
+            --enable-demuxer=mov \
+            --enable-protocol=file \
+            --enable-protocol=pipe \
+            --extra-cflags="-I$FFMPEG_OUT/include" \
+            --extra-ldflags="-L$FFMPEG_OUT/lib"
+          make -j$(nproc)
+          make install
+
+      - name: Prepare Libs for Maturin
+        shell: bash
+        run: |
+          cp ffmpeg-out/bin/avcodec.lib ffmpeg-out/bin/libavcodec.lib || true
+          cp ffmpeg-out/bin/avutil.lib ffmpeg-out/bin/libavutil.lib || true
+          cp ffmpeg-out/bin/avformat.lib ffmpeg-out/bin/libavformat.lib || true
+          cp ffmpeg-out/bin/swscale.lib ffmpeg-out/bin/libswscale.lib || true
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        env:
+          FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-out
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --find-interpreter
+          sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+      - name: Repair wheels with delvewheel (Bundle DLLs)
+        run: |
+          pip install delvewheel
+          delvewheel repair dist\*.whl --add-path "ffmpeg-out\bin;C:\msys64\mingw64\bin" -w dist\repaired
+          Move-Item -Force dist\repaired\*.whl dist\
+          Remove-Item -Recurse -Force dist\repaired
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v6
+        with:
+          name: wheels-windows-${{ matrix.target }}
+          path: dist
+
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - name: Upload sdist
+        uses: actions/upload-artifact@v6
+        with:
+          name: wheels-sdist
+          path: dist
+
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    if: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
+    needs: [linux, windows, sdist]
+    permissions:
+      id-token: write
+      contents: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v7
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: 'wheels-*/*'
+      - name: Install uv
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        uses: astral-sh/setup-uv@v7
+      - name: Publish to PyPI
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        run: uv publish 'wheels-*/*'
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
