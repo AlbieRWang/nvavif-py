@@ -333,24 +333,32 @@ uv run python uvtest\benchmark.py --skip-max-dimension 8192 --device-repeats 5
 
 ```powershell
 # 默认：test_imgs -> uvtest\out\compressed，cq=20，device=auto，8 workers
+# 默认策略：JPEG 质量基线过滤（估质量 <85 保留源文件）+ 尺寸兜底（压完不小则保留源）
 uv run python uvtest\compress_dir.py
 # web 档质量 / 指定目录 / SSIM 目标质量 / 限并行度 / 关报表
 uv run python uvtest\compress_dir.py --cq 26
 uv run python uvtest\compress_dir.py --src 某目录 --dst 某目录
 uv run python uvtest\compress_dir.py --auto-quality 80
 uv run python uvtest\compress_dir.py --workers 4
+uv run python uvtest\compress_dir.py --min-jpeg-quality 0 --no-keep-smaller   # 全部强压
 uv run python uvtest\compress_dir.py --report none
 ```
 
+**过滤策略（2026-09-05）**：目标是"效率最好、输出永不比源大"，分两层：
+
+1. **事前过滤** `--min-jpeg-quality 85`：从 JPEG 量化表零成本估计源质量（IJG 逆映射，不解码像素）。低于基线的源 JPEG 已经比 cq 目标压得更狠，再编只会变大或白费时间，直接保留源文件。实测 23 张低质量 JPEG 全部零成本跳过，其中 22 张正是上一轮"压完变大"的图（96% 精确率，1 张误杀，阈值可调）。
+2. **事后兜底** `--keep-smaller`：编码后若 AVIF 不小于源文件，不落盘、保留源（兜住事前漏网的高质量但难压的图，实测拦下 1 张）。
+
 全量实测（79 张 / 1099.5 MP，默认 cq=20）：
 
-| 版本 | 耗时 | 聚合吞吐 |
-|---|---:|---:|
-| 串行初版 | 228.8 s | 4.80 MP/s |
-| 串行 + 资源报表 | 205.5 s | 5.35 MP/s（NVENC 占用 0.1%、GPU 9% → 催生方案 H/I1） |
-| **并行版（方案 H + I1，8 workers）** | **45.0 s** | **24.4 MP/s（4.57×）**，3.11 倍压缩率 |
+| 版本 | 耗时 | 吞吐 | 存储 |
+|---|---:|---:|---|
+| 串行初版 | 228.8 s | 4.80 MP/s | 406.4 → 132.7 MB（3.06×） |
+| 串行 + 资源报表 | 205.5 s | 5.35 MP/s | 132.7 MB（NVENC 占用 0.1%、GPU 9% → 催生方案 H/I1） |
+| 并行 + I1（8 workers） | 45.0 s | 24.4 MP/s | 130.8 MB（3.11×） |
+| **并行 + I1 + 过滤策略** | **25.7 s** | 38.5 MP/s（编码部分） | **124.2 MB（3.27×，省 69%），无任何输出比源大** |
 
-不透明图冒烟 8 张达 99 MP/s。超大图（>8192）单张从 49 s 降到 16 s（方案 I1）；多张超大图并行时因 rav1e 抢核单张回升到 ~40 s，但总墙钟仍大幅受益。
+不透明图冒烟 8 张达 99 MP/s。超大图（>8192）单张从 49 s 降到 16 s（方案 I1）；多张超大图并行时因 rav1e 抢核单张回升到 ~23 s，但总墙钟仍大幅受益。
 
 每次运行默认在输出目录生成 `compress_report.json`：逐图（尺寸/模式/是否alpha/源大小/输出大小/压缩率/bpp/耗时/MP/s）+ 全程资源采样（CPU%/内存，含全部子进程；GPU%/NVENC 编码器占用%/显存）。后续性能优化以此为基线。
 

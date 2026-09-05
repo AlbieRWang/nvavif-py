@@ -50,6 +50,52 @@ IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".g
 # Driver cap on concurrent NVENC sessions for consumer GPUs (RTX 40 series).
 NVENC_SESSION_LIMIT = 8
 
+# IJG standard luminance quantization table (the baseline every mainstream
+# JPEG encoder scales to express its quality setting).
+_IJG_LUMA_TABLE = [
+    16, 11, 10, 16, 24, 40, 51, 61,
+    12, 12, 14, 19, 26, 58, 60, 55,
+    14, 13, 16, 24, 40, 57, 69, 56,
+    14, 17, 22, 29, 51, 87, 80, 62,
+    18, 22, 37, 56, 68, 109, 103, 77,
+    24, 35, 55, 64, 81, 104, 113, 92,
+    49, 64, 78, 87, 103, 121, 120, 101,
+    72, 92, 95, 98, 112, 100, 103, 99,
+]
+
+
+def estimate_jpeg_quality(path: Path) -> float:
+    """Estimate a JPEG's IJG quality setting from its quantization tables.
+
+    Zero-cost (no pixel decoding). Returns 0 if the tables are unreadable
+    (caller should not rely on the estimate).
+
+    IJG mapping: quality <= 50 -> scale = 5000/quality; quality > 50 ->
+    scale = 200 - 2*quality. Each table entry is base*scale/100 (clamped
+    1..255), so an entry implies a scale; average over entries and invert.
+    """
+    try:
+        from PIL import Image
+
+        with Image.open(path) as im:
+            tables = im.quantization
+            luma = tables.get(0)
+            if not luma or len(luma) != 64:
+                return 0.0
+            scales = []
+            for got, base in zip(luma, _IJG_LUMA_TABLE):
+                if base < 1 or got < 1:
+                    continue
+                scales.append(got * 100.0 / base)
+            if not scales:
+                return 0.0
+            scale = sum(scales) / len(scales)
+            if scale < 100:  # quality > 50
+                return round(max(50.0, (200.0 - scale) / 2.0))
+            return round(min(50.0, 5000.0 / scale))
+    except Exception:
+        return 0.0
+
 
 def default_workers() -> int:
     # Half the cores leaves headroom for the in-worker rav1e alpha threads.
@@ -70,6 +116,20 @@ def _encode_task(task: dict) -> dict:
         kwargs["cq"] = task["cq"]
     data = nv.encode_file(path, **kwargs)
     elapsed = time.perf_counter() - t0
+
+    # Guard: never store something bigger than the source. The source stays
+    # wherever it is, so "keeping" it costs zero additional bytes.
+    if task["keep_smaller"] and len(data) >= path.stat().st_size:
+        return {
+            "ok": True,
+            "row": {
+                "name": path.name,
+                "action": "kept_source",
+                "src_bytes": path.stat().st_size,
+                "avif_bytes": len(data),
+                "encode_s": round(elapsed, 3),
+            },
+        }
     out_path.write_bytes(data)
 
     with Image.open(path) as im:
@@ -79,6 +139,7 @@ def _encode_task(task: dict) -> dict:
         "ok": True,
         "row": {
             "name": path.name,
+            "action": "encoded",
             "mode": mode,
             "alpha": "A" in mode.upper() or mode == "PA",
             "width": width,
@@ -201,6 +262,19 @@ def main() -> None:
     parser.add_argument("--device", choices=["auto", "gpu", "cpu"], default="auto")
     parser.add_argument("--workers", type=int, default=None, help="parallel encode processes (default: min(8, cores/2); NVENC session limit is the hard cap)")
     parser.add_argument("--limit", type=int, default=None, help="only process the first N images (smoke test)")
+    parser.add_argument(
+        "--min-jpeg-quality",
+        type=float,
+        default=85.0,
+        metavar="Q",
+        help="skip JPEG sources whose estimated IJG quality is below Q (they are already more compressed than the cq target would be; 0 disables)",
+    )
+    parser.add_argument(
+        "--keep-smaller",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="keep the source (write nothing) when the AVIF is not smaller (default: on)",
+    )
     parser.add_argument("--overwrite", action="store_true", help="re-encode even if the .avif already exists")
     parser.add_argument(
         "--report",
@@ -221,11 +295,20 @@ def main() -> None:
     workers = min(workers, len(files))
 
     tasks = []
+    skipped_quality: list[dict] = []
     for i, path in enumerate(files, 1):
         out_path = args.dst / (path.stem + ".avif")
         if out_path.exists() and not args.overwrite:
             print(f"[{i}/{len(files)}] skip (exists): {out_path.name}")
             continue
+        # Pre-filter: a JPEG already compressed harder than our cq target can
+        # only grow or waste encode time — keep it and move on (zero cost).
+        if args.min_jpeg_quality > 0 and path.suffix.lower() in (".jpg", ".jpeg"):
+            q = estimate_jpeg_quality(path)
+            if 0 < q < args.min_jpeg_quality:
+                skipped_quality.append({"name": path.name, "estimated_quality": q, "src_bytes": path.stat().st_size})
+                print(f"[{i}/{len(files)}] skip (source JPEG quality ~{q:.0f} < {args.min_jpeg_quality:.0f}): {path.name}")
+                continue
         tasks.append(
             {
                 "index": i,
@@ -234,11 +317,14 @@ def main() -> None:
                 "cq": args.cq,
                 "auto_quality": args.auto_quality,
                 "device": args.device,
+                "keep_smaller": args.keep_smaller,
             }
         )
 
     total_in = total_out = 0
     total_px = 0
+    kept_src_bytes = 0
+    kept_source = 0
     failures: list[str] = []
     rows: list[dict] = []
     started = time.perf_counter()
@@ -258,6 +344,14 @@ def main() -> None:
                     result = future.result()
                     row = result["row"]
                     rows.append(row)
+                    if row["action"] == "kept_source":
+                        kept_source += 1
+                        kept_src_bytes += row["src_bytes"]
+                        print(
+                            f"{tag} {row['name']}: kept source (AVIF would be "
+                            f"{row['avif_bytes']/1e6:.2f} MB >= source {row['src_bytes']/1e6:.2f} MB)"
+                        )
+                        continue
                     total_in += row["src_bytes"]
                     total_out += row["out_bytes"]
                     total_px += row["megapixels"] * 1e6
@@ -276,12 +370,22 @@ def main() -> None:
     n = len(rows)
     rows.sort(key=lambda r: r["name"])
     print("\n=== summary ===")
-    print(f"encoded {n}/{len(files)} images in {elapsed:.1f} s ({workers} workers)")
+    print(f"encoded {sum(1 for r in rows if r['action'] == 'encoded')}/{len(files)} images in {elapsed:.1f} s ({workers} workers)")
+    if skipped_quality:
+        print(f"pre-filter: {len(skipped_quality)} JPEG sources below quality {args.min_jpeg_quality:.0f} kept as-is")
+    if kept_source:
+        print(f"guard: {kept_source} images kept as source (AVIF was not smaller)")
     if total_px:
         print(
-            f"total {total_px/1e6:.1f} MP, throughput {total_px/1e6/max(elapsed,1e-6):.2f} MP/s, "
+            f"encoded: {total_px/1e6:.1f} MP, throughput {total_px/1e6/max(elapsed,1e-6):.2f} MP/s, "
             f"{total_in/1e6:.1f} MB -> {total_out/1e6:.1f} MB ({total_in/max(total_out,1):.2f}x, "
             f"saved {100*(1-total_out/max(total_in,1)):.0f}%)"
+        )
+        final_store = total_out + kept_src_bytes
+        src_all = total_in + kept_src_bytes + sum(s["src_bytes"] for s in skipped_quality)
+        print(
+            f"overall storage: {src_all/1e6:.1f} MB -> {final_store/1e6:.1f} MB "
+            f"({src_all/max(final_store,1):.2f}x, saved {100*(1-final_store/max(src_all,1)):.0f}%)"
         )
         print(f"output folder: {args.dst}")
         if resource:
@@ -293,6 +397,8 @@ def main() -> None:
 
     if args.report != Path("none"):
         report_path = args.report if args.report.is_absolute() else args.dst / args.report
+        kept_rows = [r for r in rows if r["action"] == "kept_source"]
+        enc_rows = [r for r in rows if r["action"] == "encoded"]
         report = {
             "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "src": str(args.src),
@@ -301,18 +407,24 @@ def main() -> None:
             "auto_quality": args.auto_quality,
             "device": args.device,
             "workers": workers,
+            "min_jpeg_quality": args.min_jpeg_quality,
+            "keep_smaller": args.keep_smaller,
             "summary": {
-                "encoded": n,
                 "total": len(files),
+                "encoded": len(enc_rows),
+                "kept_source_bigger": kept_source,
+                "skipped_low_quality_jpeg": len(skipped_quality),
                 "elapsed_s": round(elapsed, 2),
                 "total_megapixels": round(total_px / 1e6, 2),
                 "aggregate_mp_per_s": round(total_px / 1e6 / max(elapsed, 1e-6), 2),
-                "src_mb": round(total_in / 1e6, 1),
-                "out_mb": round(total_out / 1e6, 1),
-                "ratio": round(total_in / max(total_out, 1), 2),
+                "encoded_src_mb": round(total_in / 1e6, 1),
+                "encoded_out_mb": round(total_out / 1e6, 1),
+                "encoded_ratio": round(total_in / max(total_out, 1), 2),
+                "final_store_mb": round((total_out + kept_src_bytes) / 1e6, 1),
                 "failures": failures,
             },
             "resource": resource,
+            "skipped_quality_jpeg": skipped_quality,
             "images": rows,
         }
         report_path.parent.mkdir(parents=True, exist_ok=True)
