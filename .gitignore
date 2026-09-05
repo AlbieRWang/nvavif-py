@@ -76,3 +76,27 @@ LLM_CONTEXT.md
 
 # LLM context file
 LLM_CONTEXT_1775659312.md
+
+# Project-local MSYS2 (3.3 GB)
+msys64/
+
+# FFmpeg source and build artifacts
+FFmpeg/
+dav1d/
+nv-codec-headers/
+ffmpeg-out/
+
+# uv test environment outputs
+uvtest/out/
+uvtest/__pycache__/
+uvtest/uv.lock
+uvtest/benchmark_results.json
+
+# uv lock file
+uv.lock
+
+# test images (79 sample files)
+test_imgs/
+
+# cortexkit workspace
+.cortexkit/
