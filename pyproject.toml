@@ -17,5 +17,25 @@ classifiers = [
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: Implementation :: PyPy",
 ]
+[tool.uv]
+# The root project must NOT be installed by uv: `uv run` would otherwise
+# replace the prebuilt wheel in .venv with a broken editable install — the
+# source package is intentionally pyd-free, so its __init__.py cannot import
+# the compiled module and shadows the wheel's. The venv gets nvavif_py from
+# the repaired wheel in dist-local/ instead.
+package = false
+
 [tool.maturin]
 module-name = "nvavif_py._nvavif_py"
+# Python package lives under source/ so no directory named `nvavif_py` sits
+# at the repo root — a same-named pyd-free dir there shadows the installed
+# wheel whenever the root lands on sys.path (python -c, pytest, IDEs).
+python-source = "source"
+
+[dependency-groups]
+dev = [
+    "delvewheel",
+    "maturin",
+    "psutil",
+    "pynvml",
+]

@@ -91,7 +91,11 @@ O:\Project\Media\nvavif-py\
 ├─ FFmpeg\       FFmpeg 8.1 源码
 ├─ dav1d\        dav1d 源码
 ├─ ffmpeg-out\   FFmpeg headers、import libs、DLL 和 dav1d 安装产物
-├─ uvtest\       uv 验证环境、测试脚本和性能报告
+├─ source\       Python 包源码（source\nvavif_py\，maturin python-source 指向这里）
+├─ uvtest\       测试脚本和性能报告（不单独建环境）
+├─ dist-local\   maturin 构建产物（未修复 wheel，delvewheel 修复的输入）
+├─ dist\repaired-current\   delvewheel 修复后的 wheel（打包 FFmpeg DLL，venv 只装这个）
+├─ setup_env.py  环境一键固化脚本（幂等，见 §5.1）
 └─ test_imgs\    样本图片
 ```
 
@@ -103,6 +107,23 @@ C:\Users\ricar\.rustup\
 ```
 
 Rust 本身不在项目目录，但 Cargo registry、MSYS2、FFmpeg、dav1d 和生成的 FFmpeg 产物均可复用，不需要每次重装。
+
+### 5.1 环境一键固化（2026-09-05）
+
+**任何环境异常，第一反应就是重跑这条命令，不要手动修：**
+
+```bash
+uv run python setup_env.py
+```
+
+它幂等完成四步：`uv sync`（pillow/numpy + dev 组：maturin、delvewheel、psutil、pynvml）→ 确保存在当前解释器对应的修复版 wheel（缺失则自动从 `dist-local\` delvewheel 修复到 `dist\repaired-current\`）→ 强制重装该 wheel 到根 `.venv` → 冒烟验证（根目录直接 import、GPU 探测、256×256 编解码回环）。全部通过打印 `ENV OK`。
+
+配套的防复发配置（都在 `pyproject.toml`）：
+
+- `[tool.uv] package = false`：uv 永不安装/卸载 nvavif_py 自身。此前 `uv run` 隐式 sync 会把 venv 里的 wheel 换成坏的 editable 安装（根目录源码包无 `.pyd`），是反复环境损坏的根源。
+- `[dependency-groups] dev`：psutil/pynvml/maturin/delvewheel 进 lock，uv 精确 sync 不再误删。
+- `python-source = "source"`：Python 包挪到 `source\nvavif_py\`，仓库根目录不再存在叫 `nvavif_py` 的目录——只要根目录进了 `sys.path`（`python -c`、pytest、IDE）就遮蔽 wheel 的问题从根上消除（§9 两次踩坑的根治）。
+- 构建流程：`build.bat`（maturin build → `dist-local\`）→ `setup_env.py` 自动 delvewheel 修复 → venv。venv 里只应存在 `dist\repaired-current\` 的修复版 wheel。
 
 ## 6. 从 PyPI 验证安装
 
@@ -268,8 +289,8 @@ delvewheel repair dist\*.whl --add-path "ffmpeg-out\bin;C:\msys64\mingw64\bin" -
 | bindgen | 找不到 `libclang.dll` | 安装 `mingw-w64-x86_64-clang` 并设置 `LIBCLANG_PATH` |
 | ffmpeg-sys-next | link detection probe 失败，普通 Cargo 输出没有显示真正原因 | 使用 verbose Cargo 输出，补齐 FFmpeg lib/include/pkg-config 路径 |
 | 本地 wheel 导入 | `_nvavif_py.pyd` 能找到，但 FFmpeg/MinGW DLL 无法加载 | 临时加入 `ffmpeg-out\bin` 和 `msys64\mingw64\bin` |
-| Python 测试 | 从仓库根目录用 `python -c` 启动时，根目录源码包（无 `.pyd`）shadow 了 venv 安装的 wheel | 统一根目录 `.venv`（见 §6），并按 §10 用 `uv run python uvtest\xxx.py` 运行——脚本方式下 `sys.path[0]` 是 `uvtest`，导入的是 venv 里的 wheel（2026-09-05 起不再单独从 uvtest 启动） |
-| Python 测试（复发） | 根目录源码包内残留旧构建的 `_nvavif_py.cp313-win_amd64.pyd`（2026-09-05 二次踩坑：`python -c` 从根目录导入时旧 `.pyd` 反而"可用"，掩盖了 venv 新 wheel，I1 改动一度"无效"） | 已删除该构建残留物；约定：源码包目录 `nvavif_py/` 里**永远不要**留 `.pyd` 构建产物，构建一律走 venv wheel 或 uv editable |
+| Python 测试 | 从仓库根目录用 `python -c` 启动时，根目录源码包（无 `.pyd`）shadow 了 venv 安装的 wheel | 统一根目录 `.venv`（见 §6），并按 §10 用 `uv run python uvtest\xxx.py` 运行——脚本方式下 `sys.path[0]` 是 `uvtest`，导入的是 venv 里的 wheel（2026-09-05 起不再单独从 uvtest 启动）。**2026-09-05 根治**：Python 包移至 `source\nvavif_py\`（`python-source`），根目录不再有同名包目录，遮蔽从根上不可能 |
+| Python 测试（复发） | 根目录源码包内残留旧构建的 `_nvavif_py.cp313-win_amd64.pyd`（2026-09-05 二次踩坑：`python -c` 从根目录导入时旧 `.pyd` 反而"可用"，掩盖了 venv 新 wheel，I1 改动一度"无效"） | 已删除该构建残留物；约定：`source\nvavif_py\` 里**永远不要**留 `.pyd` 构建产物。配套根治见 §5.1（`package = false` + dev 组 + `setup_env.py` 一键固化） |
 | 全量样本测试 | 超大图进入 rav1e 后耗时很长 | 本轮测试跳过宽或高大于 `8192` 的图片 |
 
 ## 10. 测试脚本与运行方法
@@ -444,7 +465,11 @@ P95 编码耗时：6.95 秒
 
 speed 9 比 speed 8 再快约一倍，文件大约 10%，保真度相当，选为默认。alpha 量化器逻辑不变（`a_cq = cq - 4`）。
 
-同时发现一个独立 bug：`0-16 07-57-11.png` 和 `13 07-56-48-9236.png` 两张图无论 Pillow 插件还是 `decode_file()` 解码出的 alpha 都与源图不符（MAE 75~153，max 255），且与 alpha 编码速度设置无关（基线和调参后同样出现）。属于独立的 alpha 编码或解码缺陷，待排查。
+同时发现一个独立 bug：`0-16 07-57-11.png` 和 `13 07-56-48-9236.png` 两张图无论 Pillow 插件还是 `decode_file()` 解码出的 alpha 都与源图不符（MAE 75~153，max 255），且与 alpha 编码速度设置无关（基线和调参后同样出现）。
+
+**已修复（2026-09-06），根因是 rav1e 的 `asm` 特性**： rav1e 0.7.1 的 NASM SIMD 内核在本机工具链（nasm-rs 自编译 NASM）下对硬边、大面积平坦的单色内容（二值 alpha 掩码）产生**静默损坏的重建像素**——Cs420 颜色路径同一内容正常，Cs400 alpha 路径触发；CDEF 的 `cdef.rs:95` debug_assert 是症状不是病因（debug 构建直接 panic，release 构建 assert 被编译掉、静默输出坏码流）。用 ffmpeg 独立解码与 `decode_file()` 错误完全一致，证明容器里的码流本身就是坏的；这也解释了浏览器中透明显示异常（浏览器如实合成坏 alpha）而 Windows 看图软件"黑底正常"（不合成 alpha）。
+
+修复：`Cargo.toml` 中 rav1e 去掉 `asm` feature（`features = ["threading"]`），CDEF/LRF 照常开启。验证（`uvtest/diag_alpha_bug.py`，3 张图）：两张问题图 alpha MAE 153.17/141.47 → **0.05/0.03**，ffmpeg 参考解码一致；10 张透明图全集 61.2 MP 单进程 10.88 s（5.63 MP/s，比 asm 版慢约 10~25%，可接受），最差 alpha MAE 0.054。回归测试固化在 `src/lib.rs` 的 `alpha_dbg_tests`（输入 fixture 由 `diag_alpha_bug.py` 生成，缺失时跳过）。若未来要恢复 asm，需先换可信 NASM 构建并重跑本回归。
 
 脚本：`uvtest/bench_alpha_tuning.py`；报告：`uvtest/out/alpha_tuning/*.json`。
 

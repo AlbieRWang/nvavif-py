@@ -16,6 +16,8 @@ Usage (from the repo root, single root .venv):
     uv run python uvtest/compress_dir.py --src DIR --dst DIR   # custom folders
     uv run python uvtest/compress_dir.py --auto-quality 80     # SSIM-targeted quality
     uv run python uvtest/compress_dir.py --workers 4           # cap parallelism
+    uv run python uvtest/compress_dir.py --transparent-format webp   # transparent -> WebP (lossless alpha, beat AVIF on the hard-edged transparent set: 3.5 MB/5.0 s vs 6.1 MB/12.3 s)
+    uv run python uvtest/compress_dir.py --copy-skipped        # mirror skipped/kept sources into the output folder
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import threading
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -30,8 +33,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# Same DLL registration as bench_alpha_tuning.py: the local wheel links
-# against ffmpeg-out and msys64 runtime DLLs that are not on the system PATH.
+# Same DLL registration as bench_alpha_tuning.py. With the repaired wheel
+# (dist/repaired-current, installed by setup_env.py) the FFmpeg DLLs are
+# bundled and this is a no-op fallback kept for unrepaired dist-local wheels.
 # Module level so pool workers (which re-import this file) get it too.
 for _dll_dir in (
     ROOT / "ffmpeg-out" / "bin",
@@ -107,8 +111,62 @@ def _encode_task(task: dict) -> dict:
     from PIL import Image
 
     path = Path(task["path"])
-    out_path = Path(task["out_path"])
+    out_dir = Path(task["out_path"]).parent
     t0 = time.perf_counter()
+
+    # Transparent images can be routed to WebP/PNG instead of AVIF: WebP
+    # codes alpha losslessly, beats AVIF on hard-edged masks (measured
+    # 3.5 MB / 5.0 s vs 6.1 MB / 12.3 s on the transparent test set), and
+    # carries zero rav1e risk. Opaque images stay on the GPU AVIF path.
+    fmt = task["transparent_format"]
+    if fmt != "avif":
+        with Image.open(path) as im:
+            rgba = im.convert("RGBA")
+            alpha_lo, _ = rgba.getchannel("A").getextrema()
+        if alpha_lo < 255:  # real transparency (constant-opaque stays on AVIF)
+            out_path = out_dir / (path.stem + f".{fmt}")
+            if fmt == "webp":
+                rgba.save(out_path, "WEBP", quality=task["webp_quality"], method=4)
+            else:
+                rgba.save(out_path, "PNG")
+            elapsed = time.perf_counter() - t0
+            src_bytes = path.stat().st_size
+            out_bytes = out_path.stat().st_size
+            if task["keep_smaller"] and out_bytes >= src_bytes:
+                out_path.unlink()
+                return {
+                    "ok": True,
+                    "row": {
+                        "name": path.name,
+                        "action": "kept_source",
+                        "format": fmt,
+                        "src_bytes": src_bytes,
+                        "avif_bytes": out_bytes,
+                        "encode_s": round(elapsed, 3),
+                    },
+                }
+            with Image.open(path) as im:
+                width, height, mode = im.width, im.height, im.mode
+            return {
+                "ok": True,
+                "row": {
+                    "name": path.name,
+                    "action": "encoded",
+                    "format": fmt,
+                    "mode": mode,
+                    "alpha": True,
+                    "width": width,
+                    "height": height,
+                    "megapixels": round(width * height / 1e6, 3),
+                    "src_bytes": src_bytes,
+                    "out_bytes": out_bytes,
+                    "ratio": round(src_bytes / max(out_bytes, 1), 2),
+                    "bits_per_pixel": round(out_bytes * 8 / max(width * height, 1), 3),
+                    "encode_s": round(elapsed, 3),
+                    "mp_per_s": round(width * height / 1e6 / max(elapsed, 1e-6), 2),
+                },
+            }
+
     kwargs = {"device": task["device"]}
     if task["auto_quality"] is not None:
         kwargs.update(auto_cq=True, target_quality=task["auto_quality"])
@@ -119,12 +177,16 @@ def _encode_task(task: dict) -> dict:
 
     # Guard: never store something bigger than the source. The source stays
     # wherever it is, so "keeping" it costs zero additional bytes.
+    out_path = Path(task["out_path"])
     if task["keep_smaller"] and len(data) >= path.stat().st_size:
+        if task["copy_skipped"]:
+            shutil.copy2(path, out_path.parent / path.name)
         return {
             "ok": True,
             "row": {
                 "name": path.name,
                 "action": "kept_source",
+                "format": "avif",
                 "src_bytes": path.stat().st_size,
                 "avif_bytes": len(data),
                 "encode_s": round(elapsed, 3),
@@ -140,6 +202,7 @@ def _encode_task(task: dict) -> dict:
         "row": {
             "name": path.name,
             "action": "encoded",
+            "format": "avif",
             "mode": mode,
             "alpha": "A" in mode.upper() or mode == "PA",
             "width": width,
@@ -275,7 +338,20 @@ def main() -> None:
         default=True,
         help="keep the source (write nothing) when the AVIF is not smaller (default: on)",
     )
-    parser.add_argument("--overwrite", action="store_true", help="re-encode even if the .avif already exists")
+    parser.add_argument(
+        "--copy-skipped",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="copy skipped/kept sources unchanged into the output folder so it mirrors the input set (default: off)",
+    )
+    parser.add_argument(
+        "--transparent-format",
+        choices=["avif", "webp", "png"],
+        default="avif",
+        help="output format for images with real transparency (default: avif). webp codes alpha losslessly and beat AVIF on the hard-edged transparent test set (3.5 MB/5.0 s vs 6.1 MB/12.3 s)",
+    )
+    parser.add_argument("--webp-quality", type=int, default=90, help="WebP quality 0-100 for --transparent-format webp (default: 90)")
+    parser.add_argument("--overwrite", action="store_true", help="re-encode even if the output already exists")
     parser.add_argument(
         "--report",
         type=Path,
@@ -296,16 +372,26 @@ def main() -> None:
 
     tasks = []
     skipped_quality: list[dict] = []
+    seen_stems: set[str] = set()
+    out_exts = ("avif", "webp", "png")
     for i, path in enumerate(files, 1):
-        out_path = args.dst / (path.stem + ".avif")
-        if out_path.exists() and not args.overwrite:
-            print(f"[{i}/{len(files)}] skip (exists): {out_path.name}")
+        # Suffix collision guard: a.png and a.jpg would otherwise write the
+        # same output name — disambiguate the later one by source suffix.
+        stem = path.stem
+        if stem in seen_stems:
+            stem = f"{path.stem}_{path.suffix.strip('.')}"
+        seen_stems.add(stem)
+        out_path = args.dst / (stem + ".avif")
+        if not args.overwrite and any((args.dst / f"{stem}.{e}").exists() for e in out_exts):
+            print(f"[{i}/{len(files)}] skip (exists): {stem}.*")
             continue
         # Pre-filter: a JPEG already compressed harder than our cq target can
         # only grow or waste encode time — keep it and move on (zero cost).
         if args.min_jpeg_quality > 0 and path.suffix.lower() in (".jpg", ".jpeg"):
             q = estimate_jpeg_quality(path)
             if 0 < q < args.min_jpeg_quality:
+                if args.copy_skipped:
+                    shutil.copy2(path, args.dst / path.name)
                 skipped_quality.append({"name": path.name, "estimated_quality": q, "src_bytes": path.stat().st_size})
                 print(f"[{i}/{len(files)}] skip (source JPEG quality ~{q:.0f} < {args.min_jpeg_quality:.0f}): {path.name}")
                 continue
@@ -318,6 +404,9 @@ def main() -> None:
                 "auto_quality": args.auto_quality,
                 "device": args.device,
                 "keep_smaller": args.keep_smaller,
+                "copy_skipped": args.copy_skipped,
+                "transparent_format": args.transparent_format,
+                "webp_quality": args.webp_quality,
             }
         )
 
@@ -375,6 +464,8 @@ def main() -> None:
         print(f"pre-filter: {len(skipped_quality)} JPEG sources below quality {args.min_jpeg_quality:.0f} kept as-is")
     if kept_source:
         print(f"guard: {kept_source} images kept as source (AVIF was not smaller)")
+    if args.copy_skipped and (kept_source or skipped_quality):
+        print(f"copy-skipped: {kept_source + len(skipped_quality)} sources copied unchanged into the output folder")
     if total_px:
         print(
             f"encoded: {total_px/1e6:.1f} MP, throughput {total_px/1e6/max(elapsed,1e-6):.2f} MP/s, "
@@ -409,6 +500,9 @@ def main() -> None:
             "workers": workers,
             "min_jpeg_quality": args.min_jpeg_quality,
             "keep_smaller": args.keep_smaller,
+            "copy_skipped": args.copy_skipped,
+            "transparent_format": args.transparent_format,
+            "webp_quality": args.webp_quality,
             "summary": {
                 "total": len(files),
                 "encoded": len(enc_rows),
