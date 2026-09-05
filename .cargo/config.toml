@@ -1,0 +1,12 @@
+# Build environment for ffmpeg-sys-next / bindgen / rav1e, so that
+# `uv run` (which builds this maturin project via its build backend)
+# works without manually setting the variables that build.bat exports.
+# Paths are machine-local (same values as build.bat).
+[env]
+FFMPEG_DIR = 'O:\Project\Media\nvavif-py\ffmpeg-out'
+FFMPEG_INCLUDE_DIR = 'O:\Project\Media\nvavif-py\ffmpeg-out\include'
+FFMPEG_LIB_DIR = 'O:\Project\Media\nvavif-py\ffmpeg-out\lib'
+PKG_CONFIG_PATH = 'O:\Project\Media\nvavif-py\ffmpeg-out\lib\pkgconfig'
+PKG_CONFIG = 'O:\Project\Media\nvavif-py\msys64\mingw64\bin\pkg-config.exe'
+LIBCLANG_PATH = 'O:\Project\Media\nvavif-py\msys64\mingw64\bin'
+NASM = 'O:\Project\Media\nvavif-py\msys64\mingw64\bin\nasm.exe'

@@ -2,7 +2,7 @@
 
 > 基于 nvavif_py 0.1.0 源码（1602 行 Rust + PyO3）及 `uvtest/benchmark.py` 实测数据。
 
-本文的优化目标是把输入图片转换为压缩率较高且尽量保真的图片，同时保持 RGB/RGBA 信息正确，并控制编码成本。浏览器只是透明度和标准解码路径的一个验证工具，不是格式选择的前置限制；压缩率、画质保真度、alpha 正确性和编码速度才是主要评价指标。
+本文的优化目标是把输入图片转换为压缩率较高且尽量保真的图片，同时保持 RGB/RGBA 信息正确，并控制编码成本。浏览器只是透明度和标准解码路径的一个验证工具，不是格式选择的前置限制；压缩率、画质保真度、alpha 正确性和编码速度才是主要评价指标。使用层面的最终目的（2026-09-05 明确）：**调用 NVIDIA GPU 加速海量图片（混合内容图库，普通图与透明 PNG 混杂）的批量压缩，透明通道不丢失，透明图路径不被 CPU alpha 编码拖垮**。
 
 ---
 
@@ -183,7 +183,7 @@ AV1_MONOCHROME_RESULT=not_reported
 除了 native API capability probe，还用一个固定脚本（已随 2026-09-05 实验清理删除）验证了绕过库、直接把灰度 alpha 帧交给 CUDA/NVENC 的结果：
 
 ```bash
-uv run --no-sync python uvtest/force_gpu_alpha_experiment.py
+uv run python uvtest/force_gpu_alpha_experiment.py
 ```
 
 在 RTX 4070、`1024x1024`、`preset=p6`、`constqp/qp=20` 条件下：
@@ -209,8 +209,8 @@ HEVC_ALPHA_ENCODE=NV_ENC_SUCCESS (0) total_bytes=128131 alpha_bytes=11890
 测试输入是 `500x500` 的真实透明 PNG，不是合成的无 alpha 图。NAL 解析得到 layer ID 0 和 layer ID 1，说明 alpha 确实进入硬件输出。完整实验当时由以下脚本复现（已随 2026-09-05 实验清理删除，结果记录保留在本节及 DEVELOPMENT_NOTES §14.1）：
 
 ```bash
-uv run --no-sync python uvtest/test_hevc_alpha_image.py
-uv run --no-sync python uvtest/inspect_hevc_layers.py uvtest/out/gpu_alpha_experiment/nvenc_hevc_alpha_probe.h265
+uv run python uvtest/test_hevc_alpha_image.py
+uv run python uvtest/inspect_hevc_layers.py uvtest/out/gpu_alpha_experiment/nvenc_hevc_alpha_probe.h265
 ```
 
 HEIF 封装存在独立阻塞：libheif 1.23.1 的标准 alpha 路径是主图加 `auxl` alpha item，且其源码暂不支持 layered HEVC 的 `lhv1` item。NVIDIA 的 HEVC alpha 输出不能直接交给当前 libheif，也不能通过普通 `hevc_nvenc` CLI 选项自动完成。需要支持 `lhv1` 的 HEIF writer/reader，或自定义 BMFF 封装和验证链路。
@@ -337,16 +337,61 @@ let codec = ffmpeg::decoder::find_by_name("av1_nvdec")
 
 **推荐等级**：★★☆ 收益明显，但解码路径改造复杂。
 
+### 方案 H：进程级并行压缩管线（新增 2026-09-05，低风险，当前最大收益）
+
+**实测依据**（2026-09-05 全量基准，`uvtest/out/compressed/compress_report.json`，79 张 / 1099.5 MP / 205.5 s）：单进程串行下 NVENC 编码器平均占用仅 **0.1%**（峰值 11%），GPU 整体平均 **9%**，CPU 平均 774%/2800%（28 逻辑核）。GPU 和 CPU 双侧都大面积空闲——瓶颈不是算力，是串行调度。
+
+**思路**：不动 Rust 库，纯上层编排。`compress_dir.py` 改用 `ProcessPoolExecutor`，每张图独立调用 `encode_file()`：
+
+- 每个 worker 自行注册 `ffmpeg-out\bin` / `msys64\mingw64\bin` DLL 目录（现有脚本逻辑搬进 worker 初始化）。
+- **worker 数上限受 NVENC 并发会话数约束**（消费级驱动 RTX 40 系 ≈ 8）。取 `min(8, 核数/2)` 起步；NVENC 会话创建失败的 worker 自动降级 CPU，不中断。
+- 透明图多的图库要下调 worker 数：alpha 的 rav1e 已用满多核（`threads=0`），跨图并行会互相抢核。经验起点：透明占比 >30% 时 worker = 核数/4。
+- 超大图（>8192）提交前按尺寸直接路由（顺带落实方案 D 的预检查，避免每次先撞一次 NVENC 报错）。
+- 报表兼容：worker 上报逐图 rows，主进程聚合写 `compress_report.json`；资源采样用 psutil 遍历进程树求和。
+
+**预期收益**：GPU 路径 25.6 → 80~100+ MP/s；混合图库整体 4.8 → 15~25 MP/s；1TB 从 ~6.5 天缩到 1~2 天。
+
+**代价**：~100 行 Python，不动库，零接口变化。
+
+**推荐等级**：★★★ **首选**。GPU 空闲 90%+ 是实测数据，先吃满现有算力，再谈库内改造。
+
+**落地结果（2026-09-05）**：已在 `uvtest/compress_dir.py` 实现（`ProcessPoolExecutor` + `--workers`，默认 `min(8, 核数/2)`；资源采样覆盖整个进程树）。全量 79 张实测 **205.5 s → 45.0 s（4.57×）**，5.35 → **24.4 MP/s**；8 张不透明图冒烟达 **99 MP/s**；NVENC 占用峰值从 11% 提到 100%。已观察到的次级问题：多张超大图并行时各 worker 的 rav1e `threads=0` 互相抢核，单张耗时从独占的 16 s 涨回 ~40 s（总墙钟仍大幅受益）——后续可按 worker 数切分 rav1e 线程额度。
+
+### 方案 I：超大图（>8192）路径优化（新增 2026-09-05）
+
+**现状**：全量基准中 4 张 101.7MP 超大图自动 CPU 回退，每张 39~50 s（约 2.2 MP/s），**占总时长 87%**。长尾决定整体。
+
+**I1：CPU 回退颜色编码换快速 preset（~10 行，性价比最高）**
+
+CPU 颜色路径目前继承 NVENC preset P7 → rav1e speed 4（很慢）。对 >8192 的回退路径改用更快的 speed（如 6，或同 alpha 思路固定 speed 9 可配）。预期单张 40 s → 8~15 s（3~5 倍），长尾时间占比从 87% 降到 ~60%。画质损失需按 `auto_cq`/SSIM 验证后再定档。与 `ALPHA_RAV1E_PRESET` 同一模式，改动约 10 行。
+
+**I2：AVIF grid 分块（中等工作量，超大图全 GPU）**
+
+>8192 时切成 ≤8192 的块，逐块 NVENC 编码（颜色 + alpha），按 AVIF grid 规范（`grid` derived item + `iref dimg`）拼回**单个文件**。浏览器和 libheif 对 grid 支持普遍（大图 AVIF 的标准做法）。
+
+阻塞点：`avif-serialize 0.8.8` 不支持 grid（源码无 grid/dimg），需要自写 grid 封装。有 §14.2 手写 BMFF box 的成功经验，预估 ~300 行 Rust + 三方解码验证（浏览器/libheif/ffmpeg）。
+
+收益：101.7MP 单张 40 s → ~4 s（10 倍）。仅在图库超大图占比高时值得。
+
+**I3（不推荐）**：降采样绕过 8192 限制——隐式改变分辨率，破坏保真目标；如业务接受应由上层显式缩放后再入库。
+
+**判断**：先做 I1（10 行换长尾 3~5 倍）；I2 视图库中 >8192 图的实际占比决定。
+
+**I1 落地结果（2026-09-05）**：`src/lib.rs` 新增 `OVERSIZE_RAV1E_PRESET = 4`（rav1e speed 7）与 `cpu_color_preset()` 路由——**仅当宽或高超过 NVENC 上限 8192** 时 CPU 回退使用快速 preset，普通图的瞬时 NVENC 失败仍保持原 preset 画质。实测（`uvtest/test_oversize_preset.py`，01.jpg 101.7MP，cq=20）：**49.4 s → 16.2 s（3.04×）**，文件 -13.5%，SSIM 0.9355 → 0.9233（-0.012）。画质敏感场景可用 `auto_cq` 按目标 SSIM 自动补偿，或显式 `device="cpu"` 保留慢速高质量档。
+
 ---
 
 ## 5. 优先级排序
 
 | 优先级 | 方案 | 收益 | 风险 | 工作量 |
 |---|---|---|---|---|
-| **P0** | 方案 D：尺寸预检查 | 避免无意义 fallback | 零 | ~10 行 |
+| ~~**P0**~~ ✅ | 方案 H：进程级并行管线 | **已落地：4.57×（205.5s→45.0s）** | 低（不动库） | ~100 行 |
+| ~~**P0**~~ ✅ | 方案 D：尺寸预检查 | 由 I1 的尺寸路由覆盖 | 零 | — |
+| ~~**P1**~~ ✅ | 方案 I1：超大图 CPU 回退快速 preset | **已落地：3.04×（49.4s→16.2s）** | 低（SSIM -0.012，可用 auto_cq 补偿） | ~10 行 |
 | **P1** | 方案 A：Alpha 下采样 | alpha 4× 加速 | 低（需验证 AVIF 规范兼容性） | ~50 行 |
-| **P1** | 方案 E：批量 pipeline | 批量 3× 加速 | 低 | ~200–300 行 |
-| **P2** | 方案 B：NVENC 原生 monochrome | alpha 级别 GPU 加速 | 中高 | ~400 行 + 平台测试 |
+| **P2** | 方案 I2：AVIF grid 分块 | 超大图再 4~10× | 中 | ~300 行 |
+| **P2** | 方案 E：库内批量 pipeline | 并行后再收尾 1.5~2× | 中 | ~200–300 行 |
+| **P3** | 方案 B：NVENC 原生 monochrome | alpha 级别 GPU 加速 | 中高 | ~400 行 + 平台测试 |
 | **P3** | 方案 G：NVDEC 解码 | 解码 10× 加速 | 中 | ~300 行重构 |
 
 ---
@@ -372,8 +417,10 @@ let codec = ffmpeg::decoder::find_by_name("av1_nvdec")
 
 ### 推荐的下一步
 
-1. **立即做**：方案 D（尺寸预检查，10 行代码）
-2. **短期**：方案 E（批量 API），覆盖大部分实际使用场景
-3. **透明图生产路径**：rav1e alpha 高速档已落地（2026-09-05，`ALPHA_RAV1E_PRESET` speed 9）：61.2 MP 透明测试集 93.7 s → 5.95~9.8 s（9.6~15.7×，0.65 → 6.25~10.3 MP/s），文件 +10~25%，alpha MAE 仍在 0.1~0.7/255 量级，已接近可投产水平。剩余方向：方案 A（alpha 下采样，需兼容性验证）、方案 E（批量管线）；另发现两张测试图 alpha 解码错误（与调参无关，见 DEVELOPMENT_NOTES 11.4），需单独排查
-4. **其他硬件**：只有 probe 报告 `AV1_MONOCHROME_CAPABILITY=1` 时，才实施方案 B
-5. **持续**：方案 G（解码加速）作为独立优化路径
+1. ~~**立即做**：方案 H + 方案 D~~ ✅ 已落地（2026-09-05）：全量 79 张 **205.5 s → 45.0 s（4.57×，24.4 MP/s）**，不透明冒烟 99 MP/s。
+2. ~~**紧随其后**：方案 I1~~ ✅ 已落地（2026-09-05）：超大图回退 **49.4 s → 16.2 s（3.04×）**，SSIM -0.012（`uvtest/test_oversize_preset.py` 可复验）。
+3. **可选微调**：多 worker 并行时超大图的 rav1e 抢核（单张 16 s→40 s）——按 worker 数切分 `threads` 额度；以及 alpha 多的场景下调 worker 数（核数/4）。
+4. **透明图生产路径**：rav1e alpha 高速档已落地（2026-09-05，`ALPHA_RAV1E_PRESET` speed 9）：61.2 MP 透明测试集 93.7 s → 5.95~9.8 s（9.6~15.7×，0.65 → 6.25~10.3 MP/s），文件 +10~25%，alpha MAE 仍在 0.1~0.7/255 量级，已投产可用。剩余方向：方案 A（alpha 下采样，需兼容性验证）；另发现两张测试图 alpha 解码错误（与调参无关，见 DEVELOPMENT_NOTES 11.4），需单独排查。
+5. **H+I1 落地后再评估**：方案 I2（grid 分块，需自写 grid 封装）与方案 E（库内批量 session）——多进程并行可能已吃掉大部分收益，按残余瓶颈决定。
+6. **其他硬件**：只有 probe 报告 `AV1_MONOCHROME_CAPABILITY=1` 时，才实施方案 B。
+7. **持续**：方案 G（解码加速）作为独立优化路径。

@@ -417,6 +417,30 @@ fn extract_yuv444<R: PixelReader>(
 /// ~0.1/255 on normal images. Speed 8 was 2x slower with no fidelity gain.
 const ALPHA_RAV1E_PRESET: i32 = 2;
 
+/// NVENC AV1 input size cap (measured: any width or height above this fails,
+/// see DEVELOPMENT_NOTES §12). Images beyond it take the CPU path regardless.
+const NVENC_MAX_DIMENSION: usize = 8192;
+
+/// Preset for the CPU color encode of images that exceed the NVENC size cap.
+/// The normal CPU color path inherits the (slow) requested preset; for
+/// oversized images that makes the fallback path dominant — measured
+/// 101.7 MP in 39-50 s (2026-09-05 full-corpus run, 87% of total batch time).
+/// Preset 4 maps to rav1e speed 7; quality impact is validated in
+/// uvtest/test_oversize_preset.py.
+const OVERSIZE_RAV1E_PRESET: i32 = 4;
+
+/// Preset for a CPU color encode: oversized images (which can never take the
+/// GPU path) use the dedicated fast preset; everything else keeps the
+/// requested preset so a transient NVENC failure does not silently drop
+/// quality on normally-sized images.
+fn cpu_color_preset(preset: i32, width: usize, height: usize) -> i32 {
+    if width > NVENC_MAX_DIMENSION || height > NVENC_MAX_DIMENSION {
+        OVERSIZE_RAV1E_PRESET
+    } else {
+        preset
+    }
+}
+
 /// Software-based AV1 frame encoding using rav1e.
 /// Encoding of YUV pixel data into an AV1 bitstream via CPU.
 /// Mapping of NVENC-style quality (CQ) and speed presets to rav1e quantizer and speed parameters.
@@ -1098,8 +1122,16 @@ fn encode_avif(
                     );
                     use_gpu = false;
                     eprintln!("[nvavif_py] INFO: Estimating auto-CQ via CPU. This may take ~200-500ms extra.");
-                    estimate_cq(&color_yuv.y, width, height, depth, target_ssim, preset, false)
-                        .unwrap_or(cq)
+                    estimate_cq(
+                        &color_yuv.y,
+                        width,
+                        height,
+                        depth,
+                        target_ssim,
+                        cpu_color_preset(preset, width, height),
+                        false,
+                    )
+                    .unwrap_or(cq)
                 }
                 Err(error) => return Err(error),
             }
@@ -1149,7 +1181,7 @@ fn encode_avif(
                             height,
                             &color_yuv,
                             final_cq,
-                            preset,
+                            cpu_color_preset(preset, width, height),
                             depth,
                             chroma,
                             false,
@@ -1200,7 +1232,7 @@ fn encode_avif(
                                 height,
                                 &color_yuv,
                                 final_cq,
-                                preset,
+                                cpu_color_preset(preset, width, height),
                                 depth,
                                 chroma,
                                 false,

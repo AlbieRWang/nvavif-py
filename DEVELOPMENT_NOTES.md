@@ -14,6 +14,8 @@
 
 本文记录本次从 PyPI 可行性验证、源码问题定位、Windows 本地编译、运行时 DLL 排查，到最终批量功能和性能测试的完整过程。
 
+**项目目的（2026-09-05 明确）**：本项目在原 nvavif_py 库基础上的使用目标是**调用 NVIDIA GPU 加速海量图片的批量压缩**——图库是混合内容，普通图和透明 PNG 都有——要求输出体积小、画质保真、RGBA 透明通道不丢失，且透明图路径不能因为 CPU alpha 编码而拖垮整体吞吐。后续所有优化决策以"压缩率、画质、alpha 正确性、编码速度"四个指标为准。
+
 ## 2. 最终结论
 
 当前版本对正常尺寸图片是可用的：
@@ -267,6 +269,7 @@ delvewheel repair dist\*.whl --add-path "ffmpeg-out\bin;C:\msys64\mingw64\bin" -
 | ffmpeg-sys-next | link detection probe 失败，普通 Cargo 输出没有显示真正原因 | 使用 verbose Cargo 输出，补齐 FFmpeg lib/include/pkg-config 路径 |
 | 本地 wheel 导入 | `_nvavif_py.pyd` 能找到，但 FFmpeg/MinGW DLL 无法加载 | 临时加入 `ffmpeg-out\bin` 和 `msys64\mingw64\bin` |
 | Python 测试 | 从仓库根目录用 `python -c` 启动时，根目录源码包（无 `.pyd`）shadow 了 venv 安装的 wheel | 统一根目录 `.venv`（见 §6），并按 §10 用 `uv run python uvtest\xxx.py` 运行——脚本方式下 `sys.path[0]` 是 `uvtest`，导入的是 venv 里的 wheel（2026-09-05 起不再单独从 uvtest 启动） |
+| Python 测试（复发） | 根目录源码包内残留旧构建的 `_nvavif_py.cp313-win_amd64.pyd`（2026-09-05 二次踩坑：`python -c` 从根目录导入时旧 `.pyd` 反而"可用"，掩盖了 venv 新 wheel，I1 改动一度"无效"） | 已删除该构建残留物；约定：源码包目录 `nvavif_py/` 里**永远不要**留 `.pyd` 构建产物，构建一律走 venv wheel 或 uv editable |
 | 全量样本测试 | 超大图进入 rav1e 后耗时很长 | 本轮测试跳过宽或高大于 `8192` 的图片 |
 
 ## 10. 测试脚本与运行方法
@@ -321,6 +324,37 @@ uv run python uvtest\benchmark.py
 ```powershell
 uv run python uvtest\benchmark.py --skip-max-dimension 8192 --device-repeats 5
 ```
+
+### 10.2.1 一条命令批量压缩
+
+脚本：[`uvtest/compress_dir.py`](O:/Project/Media/nvavif-py/uvtest/compress_dir.py)
+
+生产用途的直接入口：把一个文件夹里的全部图片压成 AVIF，透明 PNG 自动保留 alpha（GPU 颜色 + 快速 CPU alpha），**进程池并行编码**（每 worker 一个 NVENC 会话，`--workers` 默认 `min(8, 核数/2)`，NVENC 并发会话上限是硬顶），结束给汇总，失败的图继续跑完再报告。
+
+```powershell
+# 默认：test_imgs -> uvtest\out\compressed，cq=20，device=auto，8 workers
+uv run python uvtest\compress_dir.py
+# web 档质量 / 指定目录 / SSIM 目标质量 / 限并行度 / 关报表
+uv run python uvtest\compress_dir.py --cq 26
+uv run python uvtest\compress_dir.py --src 某目录 --dst 某目录
+uv run python uvtest\compress_dir.py --auto-quality 80
+uv run python uvtest\compress_dir.py --workers 4
+uv run python uvtest\compress_dir.py --report none
+```
+
+全量实测（79 张 / 1099.5 MP，默认 cq=20）：
+
+| 版本 | 耗时 | 聚合吞吐 |
+|---|---:|---:|
+| 串行初版 | 228.8 s | 4.80 MP/s |
+| 串行 + 资源报表 | 205.5 s | 5.35 MP/s（NVENC 占用 0.1%、GPU 9% → 催生方案 H/I1） |
+| **并行版（方案 H + I1，8 workers）** | **45.0 s** | **24.4 MP/s（4.57×）**，3.11 倍压缩率 |
+
+不透明图冒烟 8 张达 99 MP/s。超大图（>8192）单张从 49 s 降到 16 s（方案 I1）；多张超大图并行时因 rav1e 抢核单张回升到 ~40 s，但总墙钟仍大幅受益。
+
+每次运行默认在输出目录生成 `compress_report.json`：逐图（尺寸/模式/是否alpha/源大小/输出大小/压缩率/bpp/耗时/MP/s）+ 全程资源采样（CPU%/内存，含全部子进程；GPU%/NVENC 编码器占用%/显存）。后续性能优化以此为基线。
+
+环境说明（2026-09-05 更新）：`uv run` 已可**不带 `--no-sync`** 直接使用——构建所需的 FFmpeg/pkg-config/LIBCLANG/NASM 变量固化在 `.cargo/config.toml` 的 `[env]`，`msys64\mingw64\bin` 已追加进用户 PATH（bindgen 的 `libclang.dll` 依赖同目录的 `libLLVM-22.dll`，普通 shell 没有该目录时加载失败，这是此前 `--no-sync` 约定的原因）。注意两点：uv 触发的是源码 editable 构建，修改 `src/*.rs` 后下次 `uv run` 会自动增量重编译；裸 `python -c` 导入仍需先注册 `ffmpeg-out\bin` DLL 目录（uvtest 脚本均已内置），用 `build.bat` 构建发布 wheel 的流程不变。
 
 ### 10.3 导出可查看的完整测试集
 
@@ -377,6 +411,8 @@ P95 编码耗时：6.95 秒
 
 后续 alpha 误判修复后，实际分类为 65 张不透明和 10 张真透明。11 张误判样本的编码总耗时从 41.58 s 降至 3.75 s，吞吐从 3.36 MP/s 提升至 37.23 MP/s，平均 11.09 倍。
 
+压缩率（默认 `cq=20`、P7、8bit YUV420，源文件为原始图片字节）：75 张源文件合计 380.7 MB → AVIF 合计 117.8 MB，约 **3.2 倍**（平均 1.26 bpp；混合集中含 JPEG 源，已压缩过所以整体倍率被拉低）。透明 PNG 子集（调参前基准，21 张 131.3 MB → 16.3 MB）约 8 倍；alpha 提速档（speed 9）后文件约 +16%，透明 10 张 / 61.25 MP 实测 29.6 MB → 6.1 MB，约 **4.9 倍**、省 80%。
+
 ### 11.3 GPU/CPU 固定图对比
 
 输入为同一个 `1024x1024` NumPy uint8 RGB 数组，重复 5 次并排除第一次初始化：
@@ -423,6 +459,8 @@ speed 9 比 speed 8 再快约一倍，文件大约 10%，保真度相当，选�
 
 这是 NVENC 硬件限制，不是 AVIF 容器格式的总像素限制。当前库不会自动缩放原图；`auto` 会尝试 GPU，失败后保持原始尺寸改用 CPU。
 
+超限回退的 CPU 颜色编码不再继承最慢档 preset（2026-09-05，方案 I1）：`src/lib.rs` 中 `OVERSIZE_RAV1E_PRESET = 4`（rav1e speed 7）仅对宽或高超过 `8192` 的图生效，普通图的瞬时 NVENC 失败仍保持原 preset。实测 101.7MP 单张 49.4 s → 16.2 s（3.04×），文件 -13.5%，SSIM -0.012（复验脚本 `uvtest/test_oversize_preset.py`）；画质敏感场景用 `auto_cq` 或显式 `device="cpu"`。
+
 ## 13. 原生 NVENC monochrome 探测
 
 为了确认透明 alpha 是否可以绕过 FFmpeg，直接使用 NVENC 原生 API 编码，曾新增固定测试脚本（2026-09-05 实验结束后已随实验清理删除，本节保留记录）：
@@ -457,7 +495,7 @@ AV1_MONOCHROME_RESULT=not_reported
 为了验证“即使绕过库，也把 alpha 灰度帧强行送给 GPU”是否可行，曾新增固定脚本（已随 2026-09-05 实验清理删除）：
 
 ```bash
-uv run --no-sync python uvtest/force_gpu_alpha_experiment.py
+uv run python uvtest/force_gpu_alpha_experiment.py
 ```
 
 脚本通过 FFmpeg 的 `-init_hw_device cuda=nv:0` 强制初始化 CUDA，并用 `av1_nvenc` 测试同一张 `1024x1024` alpha 灰度图：
