@@ -100,3 +100,6 @@ test_imgs/
 
 # cortexkit workspace
 .cortexkit/
+
+# Local wheel build output
+dist-local/

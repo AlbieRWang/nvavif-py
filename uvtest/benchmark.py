@@ -90,7 +90,12 @@ def run_batch(
         try:
             with Image.open(source) as image:
                 width, height = image.size
-                has_alpha = "A" in image.getbands() or "transparency" in image.info
+                has_alpha_metadata = "A" in image.getbands() or "transparency" in image.info
+                if has_alpha_metadata:
+                    rgba_arr = np.array(image.convert("RGBA"))
+                    has_alpha = bool(rgba_arr[:, :, 3].min() < 255)
+                else:
+                    has_alpha = False
         except Exception as error:
             failures.append(f"{source.name}: probe failed: {error}")
             print(f"[{index:02d}/{len(files)}] FAIL {source.name}: {error}", flush=True)

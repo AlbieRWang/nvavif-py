@@ -2,6 +2,8 @@
 
 > 基于 nvavif_py 0.1.0 源码（1602 行 Rust + PyO3）及 `uvtest/benchmark.py` 实测数据。
 
+本文的优化目标是把输入图片转换为压缩率较高且尽量保真的图片，同时保持 RGB/RGBA 信息正确，并控制编码成本。浏览器只是透明度和标准解码路径的一个验证工具，不是格式选择的前置限制；压缩率、画质保真度、alpha 正确性和编码速度才是主要评价指标。
+
 ---
 
 ## 1. 当前架构总览
@@ -48,7 +50,7 @@ build_yuv() ────────── rayon 并行 RGB→YUV420/444 转换 
 **实测影响**：
 
 | 指标 | 不透明图 | 透明图 |
-|---|---|---|
+|---|---|---|---|
 | 单图平均编码 | 286 ms | 4810 ms |
 | 批量吞吐 | 34.5 MP/s | 2.0 MP/s |
 | 最慢单图 | 16.9 s | 16.9 s |
@@ -73,12 +75,12 @@ build_yuv() ────────── rayon 并行 RGB→YUV420/444 转换 
 
 ### 3.1 测试集构成
 
-| 类别 | 数量 | 占比 |
-|---|---|---|
-| 不透明 | 54 | 72% |
-| 透明（含 alpha） | 21 | 28% |
-| 跳过（宽或高 >8192） | 4 | — |
-| 合计 | 79 | — |
+| 类别 | 数量 | 占全部 79 张 | 占可处理 75 张 |
+|---|---:|---:|---:|
+| 不透明（包括 alpha 全为 255 的 RGBA） | 65 | 82.3% | 86.7% |
+| 真透明（至少一个 alpha < 255） | 10 | 12.7% | 13.3% |
+| 跳过（宽或高 >8192） | 4 | 5.1% | — |
+| 合计 | 79 | 100% | 100% |
 
 ### 3.2 算法与参数对比
 
@@ -96,17 +98,19 @@ build_yuv() ────────── rayon 并行 RGB→YUV420/444 转换 
 | 执行并行 | 单线程 | `thread::scope` 与 alpha 并行 | `thread::scope` 与颜色并行 |
 | YUV 提取 | rayon CPU, 1 次 | rayon CPU, 2 次（颜色+alpha） | 与颜色同一 reader |
 
-### 3.3 性能数据
+### 3.3 alpha 误判修复后的性能
 
-| 指标 | 不透明（54 张） | 透明（21 张） |
-|---|---|---|
-| 平均编码 | 286 ms | 4810 ms |
-| 中位编码 | 159 ms | 4280 ms |
-| P95 编码 | 686 ms | 12694 ms |
-| 最大编码 | 1105 ms | 16883 ms |
-| 批量吞吐 | **34.5 MP/s** | **2.0 MP/s** |
-| 平均解码 | 424 ms | 349 ms |
-| 解码吞吐 | 23.3 MP/s | 27.4 MP/s |
+修复前的 benchmark 把 11 张“RGBA 但 alpha 全为 255”的图片误算进透明组，导致它们额外走了一次 CPU rav1e alpha 编码。对这 11 张图片单独对比如下：
+
+| 指标 | 修复前（11 张） | 修复后（11 张） | 改善 |
+|---|---:|---:|---:|
+| 总编码时间 | 41.58 s | 3.75 s | **减少 91.0%** |
+| 编码吞吐 | 3.36 MP/s | 37.23 MP/s | **11.09×** |
+| 像素总量 | 139.54 MP | 139.54 MP | — |
+
+按旧 benchmark 的其余 64 张耗时保持不变推算，75 张可处理图片的总编码时间约从 `116.36 s` 降至 `78.53 s`，整体吞吐约从 `6.31 MP/s` 提升至 `9.35 MP/s`，约 **1.48×**。这是替换计算，不是重新跑 75 张全量测试。
+
+这项修复只影响原本误走 alpha 路径的 11 张图片：普通 RGB/不透明 RGBA 现在都只走 GPU 颜色流；10 张真正透明的图片仍然需要 CPU rav1e 编码 alpha，透明图片的结构性瓶颈没有改变。
 
 ### 3.4 GPU vs CPU 对比（1024×1024，5 次重复）
 
@@ -118,12 +122,12 @@ build_yuv() ────────── rayon 并行 RGB→YUV420/444 转换 
 
 ### 3.5 瓶颈根源
 
-透明图的总耗时等于 `max(GPU 颜色编码, CPU alpha 编码)`。由于 CPU alpha 编码比 GPU 颜色慢 20–50 倍，GPU 的时间被完全浪费。
+真正透明图的总耗时等于 `max(GPU 颜色编码, CPU alpha 编码)`。由于 CPU alpha 编码比 GPU 颜色慢 20–50 倍，GPU 的时间仍可能被完全浪费。
 
-- 不透明图：GPU 编码 286ms，CPU 无参与，总耗时 286ms
-- 透明图：GPU 颜色 ~300ms，CPU alpha ~4800ms，并行后总耗时 ~4800ms
+- 不透明图：只做 GPU 颜色编码，当前 11 张修复样本平均约 341ms/张
+- 真透明图：GPU 颜色约 300ms，CPU alpha 仍可能需要数秒，并行后总耗时取决于 CPU alpha
 
-瓶颈是 CPU alpha，不是 GPU 颜色。解决 alpha CPU 编码才能提升透明图性能。
+对真透明图而言，瓶颈仍是 CPU alpha，不是 GPU 颜色；对误判的全不透明 RGBA，去掉无意义的 alpha 流已经消除了该瓶颈。
 
 ---
 
@@ -147,27 +151,100 @@ let (aw, ah) = if alpha_subsample == 2 { (w/2, h/2) } else { (w, h) };
 
 **推荐等级**：★★☆ 适合快速验证方向，但 AVIF 规范支持有限。
 
-### 方案 B：NVENC YUV400 支持（高风险，大收益）
+### 方案 B：NVENC 原生 monochrome（高风险，大收益）
 
-**思路**：绕过 FFmpeg 的 `av1_nvenc`，直接调用 NVENC SDK 的 C API。NVIDIA 的 NVENC 内部支持 YUV400 输入（`NV_ENC_BUFFER_FORMAT_YUV400`），但 FFmpeg 封装没有暴露。
+**思路**：绕过 FFmpeg 的 `av1_nvenc`，直接调用 NVENC SDK 的 C API。当前 NVENC 头文件没有 `NV_ENC_BUFFER_FORMAT_YUV400` 枚举，但提供了 `NV_ENC_CAPS_SUPPORT_MONOCHROME` 能力查询和 `NV_ENC_CONFIG::monoChromeEncoding=1` 会话选项。需要先确认目标驱动对 AV1 monochrome 的实际支持，以及 monochrome 会话接受的输入 buffer 格式。
 
 ```rust
 // 需要新增依赖
 // nv-codec-headers（已有）
 // nvEncodeAPI64.dll（Windows）/ libnvidia-encode.so（Linux）
-// 直接调用 NVENC CreateSession → InitializeEncoder → EncodePicture → DestroySession
+// 查询 SUPPORT_MONOCHROME，设置 monoChromeEncoding，
+// 然后调用 CreateSession → InitializeEncoder → EncodePicture → DestroySession
 ```
 
-**效果估算**：alpha 编码速度提升约 50×（GPU vs CPU），透明图 3000×3000 从 ~5s 降到 ~100ms。
+**理论收益**：如果目标 GPU/驱动支持并且 native session 可以产出兼容的 monochrome AV1，alpha 才有机会接近颜色流的 GPU 编码速度。之前的 `50x` 和 `~100ms` 只是根据普通 GPU/CPU 测试推算，不能作为本项目的实测结果。
+
+**当前机器实测结果**（RTX 4070，当前 NVIDIA 驱动）：
+
+```text
+$ bash uvtest/probe_nvenc_monochrome.sh
+NVENC_SESSION=ready
+AV1_GUID=present
+AV1_MONOCHROME_CAPABILITY=0
+AV1_INPUT_FORMATS=NV12,YV12,IYUV,YUV420_10BIT,...
+AV1_MONOCHROME_RESULT=not_reported
+```
+
+这表示当前硬件/驱动组合支持 AV1 NVENC，但没有报告 AV1 monochrome 能力。因此本机不能通过方案 B 把 AVIF alpha 安全地改成 GPU 编码。probe 脚本已于 2026-09-05 随实验清理删除；如需在其他 NVIDIA GPU 或驱动版本复测，可按本节步骤重写。
+
+#### 方案 B 的 FFmpeg 强制实验结果
+
+除了 native API capability probe，还用一个固定脚本（已随 2026-09-05 实验清理删除）验证了绕过库、直接把灰度 alpha 帧交给 CUDA/NVENC 的结果：
+
+```bash
+uv run --no-sync python uvtest/force_gpu_alpha_experiment.py
+```
+
+在 RTX 4070、`1024x1024`、`preset=p6`、`constqp/qp=20` 条件下：
+
+- 直接输入 `gray` 失败，FFmpeg 最终选择 `YUV444P`，随后 NVENC 报 `YUV444P not supported`；显式输出 `gray` 时则先提示自动选择 `gbrp`，结果相同。
+- 先转 `yuv420p` 可以在约 `230 ms` 内编码，但 `ffprobe` 识别出的码流是普通 AV1 `Main/yuv420p`，不是 YUV400。因此这不能作为 AVIF alpha item。
+- 先转 `yuv444p` 仍然被当前 RTX 4070 NVENC 拒绝。
+- 项目当前 `device="gpu"` 透明图参考耗时约 `2.4 s`，其中 GPU 只负责颜色，CPU rav1e 仍负责 alpha；这与“全 GPU”不是一回事。
+
+结论：方案 C（NV12/YUV420 伪装 YUV400）和“强制灰度送 NVENC”都不能得到可依赖的标准 AVIF alpha。当前硬件不应继续投入 AV1 native monochrome 封装实现；只在另一台机器的 `NV_ENC_CAPS_SUPPORT_MONOCHROME=1` 时重新评估方案 B。
+
+#### 方案 B2：NVENC HEVC alpha layer + HEIF（当前机器可编码，容器待解决）
+
+这条路径与 AV1 monochrome 不同。NVIDIA NVENC API 对 HEVC 提供 `NV_ENC_CAPS_SUPPORT_ALPHA_LAYER_ENCODING` 和 `NV_ENC_CONFIG_HEVC::enableAlphaLayerEncoding`，输出同时包含 HEVC 基础层和 alpha 层。当前 RTX 4070 的原生 probe 结果：
+
+```text
+HEVC_GUID=present
+HEVC_ALPHA_CAPABILITY=1
+HEVC_ALPHA_INPUT_FORMAT=ARGB
+HEVC_ALPHA_ENCODE=NV_ENC_SUCCESS (0) total_bytes=128131 alpha_bytes=11890
+```
+
+测试输入是 `500x500` 的真实透明 PNG，不是合成的无 alpha 图。NAL 解析得到 layer ID 0 和 layer ID 1，说明 alpha 确实进入硬件输出。完整实验当时由以下脚本复现（已随 2026-09-05 实验清理删除，结果记录保留在本节及 DEVELOPMENT_NOTES §14.1）：
+
+```bash
+uv run --no-sync python uvtest/test_hevc_alpha_image.py
+uv run --no-sync python uvtest/inspect_hevc_layers.py uvtest/out/gpu_alpha_experiment/nvenc_hevc_alpha_probe.h265
+```
+
+HEIF 封装存在独立阻塞：libheif 1.23.1 的标准 alpha 路径是主图加 `auxl` alpha item，且其源码暂不支持 layered HEVC 的 `lhv1` item。NVIDIA 的 HEVC alpha 输出不能直接交给当前 libheif，也不能通过普通 `hevc_nvenc` CLI 选项自动完成。需要支持 `lhv1` 的 HEIF writer/reader，或自定义 BMFF 封装和验证链路。
+
+**判断**：layered HEVC 路线在本机已证明 GPU 能编 alpha，但容器生态为零，保留为历史结论。可行的封装路线见下方案 B3。
+
+#### 方案 B3：双单层 HEVC + 标准 HEIC 双 item（2026-09-05 已验证容器层可行）
+
+绕开 layered 输出：用两条普通单层 `hevc_nvenc` 流——颜色走 NV12；alpha 用 `alphaextract` 把 alpha 平面提取为 luma、色度填 128、全范围（`yuvj420p(pc)`）——封装为标准 HEIC 的 primary `hvc1` + `auxl` alpha item，alpha item 标 `auxC urn:mpeg:hevc:2015:auxid:1` 和 `colr matrix_coefficients=0`。全程没有 `lhv1`，不需要 NVENC alpha layer 能力。
+
+实测（500x500 真透明 PNG，QP26）：
+
+| 读取方 | 结果 |
+|---|---|
+| libheif（pillow-heif） | RGBA 且 alpha 平均误差 `0.015`（max 6），颜色 MAE 2.1 |
+| FFmpeg | 双流解码正确，alpha luma 平均误差 `0.015` |
+| Windows WIC Microsoft HEIF Decoder | 打开并解码成功，与 libheif 参考件行为一致 |
+
+编码双流全部 GPU 共约 `0.56s`（含进程启动），同图当前 AVIF 路径（GPU 颜色 + CPU rav1e alpha）为 `1.07s`；alpha 流仅 2.5 KB。封装器与验证脚本（`build_hevc_alpha_heic.py`、`test_hevc_dual_heic.py`）已于 2026-09-05 清理，封装规范与踩坑记录见 DEVELOPMENT_NOTES §14.2。
+
+**判断（最终，2026-09-05）**：容器层三方（libheif/FFmpeg/WIC 解码）验证通过，文件本身合规。但查看环境实测：Windows 看图软件对所有 HEIC/AVIF 的 alpha 一律不合成（本方案文件、标准 libheif 参考件、nvavif 透明 AVIF 全部黑底；WIC 查询一律返回 `Bgr32`），浏览器又不支持 HEIC。也就是说透明 HEIC 在日常查看环境里没有任何正确显示的场景——本方案与方案 B2 一样**不能作为通用透明图生产路径**，仅适用于 libheif 生态（服务端/自研管线）。透明图提速的正道回到降低 AVIF CPU alpha 成本：rav1e 速度参数/线程调优（改动最小）、方案 A 下采样（需兼容性验证）。
+
+#### Intel UHD 770 / Raptor Lake 对照
+
+从 Intel 官方 `oneVPL-intel-gpu` 与 `media-driver` 当前 Git 源码核对，AV1 encoder capability 配置提供 `NV12`、`P010`、`AYUV`、`Y410`，没有 `YUV400`；media-driver 的 AV1 输入表也只有 `NV12`/`P010`。源码中的 `YUV400` 只用于 JPEG 或解码/通用数据结构。故 i7-14700K 核显不能据现有源码视为可直接编码 AVIF monochrome alpha，普通 AV1 编码能力与 monochrome alpha 能力必须分开判断。
 
 **代价**：
 - 需要自行实现 NVENC 原生 API 封装，约 200–400 行 Rust
 - 需要处理 Windows/Linux 平台差异
 - 需要处理 NVENC session 生命周期和 GPU 显存管理
 - 维护成本显著增加
-- 需要验证 NVIDIA 各驱动版本的 YUV400 支持稳定性
+- 需要验证 NVIDIA 各驱动版本的 monochrome 支持稳定性
 
-**推荐等级**：★★★ 收益最大但工程复杂度高，适合作为中长期目标。
+**推荐等级**：★★★ 仅适用于 capability probe 报告支持的硬件；当前 RTX 4070 不能实施。
 
 ### 方案 C：GPU 编码 Alpha 为 NV12 + 容器修正（中等风险）
 
@@ -182,7 +259,7 @@ let encoded = encode_av1_frame_gpu(width, height, &fake_nv12_alpha, ...);
 
 **效果估算**：同方案 B 速度提升，但解码正确性不确定。
 
-**代价**：不符合 AVIF 规范，可能只有 libavif / libdav1d 能正确读取，Chrome / Safari 可能渲染错误。
+**代价**：不符合 AVIF 规范，不同解码器可能产生不同结果，不能作为可靠的图片转换输出。
 
 **推荐等级**：★☆☆ 不建议，有跨解码器兼容性风险。
 
@@ -269,7 +346,7 @@ let codec = ffmpeg::decoder::find_by_name("av1_nvdec")
 | **P0** | 方案 D：尺寸预检查 | 避免无意义 fallback | 零 | ~10 行 |
 | **P1** | 方案 A：Alpha 下采样 | alpha 4× 加速 | 低（需验证 AVIF 规范兼容性） | ~50 行 |
 | **P1** | 方案 E：批量 pipeline | 批量 3× 加速 | 低 | ~200–300 行 |
-| **P2** | 方案 B：NVENC YUV400 原生 | alpha 50× 加速 | 中高 | ~400 行 + 平台测试 |
+| **P2** | 方案 B：NVENC 原生 monochrome | alpha 级别 GPU 加速 | 中高 | ~400 行 + 平台测试 |
 | **P3** | 方案 G：NVDEC 解码 | 解码 10× 加速 | 中 | ~300 行重构 |
 
 ---
@@ -278,18 +355,18 @@ let codec = ffmpeg::decoder::find_by_name("av1_nvdec")
 
 ### 当前可用性
 
-- **不透明照片批量压缩：生产可用**，GPU 编码 ~100 ms/张，吞吐 34.5 MP/s
-- **透明图片：功能正确但性能受限**，alpha CPU 编码是唯一瓶颈
+- **不透明图片批量压缩：生产可用**，65 张中包括 11 张修复后的全不透明 RGBA，均只走 GPU 颜色路径
+- **真透明图片：功能正确但性能受限**，10 张中 alpha CPU 编码仍是主要瓶颈
 - **超大图（>8192）：自动 CPU fallback**，正确但慢
 
 ### 是否可行（海量图片 GPU 加速）
 
 **对不透明图片：已可行**。当前实现已对大量普通照片使用 NVENC，1024×1024 实测 99 ms，GPU 相对 CPU 快 67.6 倍。
 
-**对透明图片：需要进一步优化**。当前 CPU alpha 编码是结构性瓶颈，除非：
+**对真透明图片：需要进一步优化**。当前 CPU alpha 编码是结构性瓶颈，除非：
 1. 接受 CPU alpha（当前方案，透明图 ~5s/张）
 2. 实现方案 A（下采样，~1.2s/张）
-3. 实现方案 B（NVENC YUV400 原生，~100ms/张）
+3. 实现方案 B（NVENC 原生 monochrome，目标约 100ms/张，需实测确认）
 
 **对超大图：建议 P0 尺寸预检查 + 上层应用自行缩放或分块**。库本身不应在编码路径中隐式改变分辨率。
 
@@ -297,5 +374,6 @@ let codec = ffmpeg::decoder::find_by_name("av1_nvdec")
 
 1. **立即做**：方案 D（尺寸预检查，10 行代码）
 2. **短期**：方案 E（批量 API），覆盖大部分实际使用场景
-3. **中期**：方案 B 或方案 A（视工程资源决定）
-4. **持续**：方案 G（解码加速）作为独立优化路径
+3. **透明图生产路径**：rav1e alpha 高速档已落地（2026-09-05，`ALPHA_RAV1E_PRESET` speed 9）：61.2 MP 透明测试集 93.7 s → 5.95~9.8 s（9.6~15.7×，0.65 → 6.25~10.3 MP/s），文件 +10~25%，alpha MAE 仍在 0.1~0.7/255 量级，已接近可投产水平。剩余方向：方案 A（alpha 下采样，需兼容性验证）、方案 E（批量管线）；另发现两张测试图 alpha 解码错误（与调参无关，见 DEVELOPMENT_NOTES 11.4），需单独排查
+4. **其他硬件**：只有 probe 报告 `AV1_MONOCHROME_CAPABILITY=1` 时，才实施方案 B
+5. **持续**：方案 G（解码加速）作为独立优化路径

@@ -11,6 +11,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from PIL import Image
+import numpy as np
 
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE_DIR = ROOT / "test_imgs"
@@ -151,7 +152,13 @@ def main() -> None:
     for index, source in enumerate(files, 1):
         with Image.open(source) as image:
             width, height = image.size
-            has_alpha = "A" in image.getbands() or "transparency" in image.info
+            # Only detect alpha when pixel data actually has transparency (min < 255)
+            has_alpha_metadata = "A" in image.getbands() or "transparency" in image.info
+            if has_alpha_metadata:
+                rgba_arr = np.array(image.convert("RGBA"))
+                has_alpha = bool(rgba_arr[:, :, 3].min() < 255)
+            else:
+                has_alpha = False
 
         if width > args.max_dimension or height > args.max_dimension:
             skipped.append({"name": source.name, "width": width, "height": height})

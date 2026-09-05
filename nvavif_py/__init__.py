@@ -279,6 +279,20 @@ def encode_file(
     if len(img_array.shape) != 3:
         raise ValueError('Image must be a three-dimensional array (H, W, C)')
 
+    if img_array.shape[2] == 4:
+        alpha = img_array[:, :, 3]
+        if np.issubdtype(img_array.dtype, np.integer):
+            opaque_alpha = np.iinfo(img_array.dtype).max
+        elif np.issubdtype(img_array.dtype, np.floating):
+            opaque_alpha = 1.0
+        else:
+            opaque_alpha = 1
+
+        # Constant opaque alpha needs no AVIF alpha item. Keeping it would
+        # route an unnecessary monochrome stream through the alpha encoder.
+        if np.all(alpha == opaque_alpha):
+            img_array = img_array[:, :, :3]
+
     h, w, c = img_array.shape
 
     # Hardware constraint: width and height must be even. If not, crop by 1 pixel.
