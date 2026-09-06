@@ -125,6 +125,8 @@ uv run python setup_env.py
 - `python-source = "source"`：Python 包挪到 `source\nvavif_py\`，仓库根目录不再存在叫 `nvavif_py` 的目录——只要根目录进了 `sys.path`（`python -c`、pytest、IDE）就遮蔽 wheel 的问题从根上消除（§9 两次踩坑的根治）。
 - 构建流程：`build.bat`（maturin build → `dist-local\`）→ `setup_env.py` 自动 delvewheel 修复 → venv。venv 里只应存在 `dist\repaired-current\` 的修复版 wheel。
 
+**新机器迁移（干净 clone）**：git 不携带任何构建产物——`dist-local\`、`dist\`、`target\` 均被忽略，目标机必须本地执行一次 `build.bat --out dist-local`（冷编译几分钟）再 `uv run python setup_env.py`，打印 `ENV OK` 即就绪。工具链依赖仓库内自带的 `msys64\` 与 `ffmpeg-out\`（迁移时直接整目录拷贝项目文件夹）；FFmpeg/pkg-config/LIBCLANG/NASM 变量已固化在 `.cargo/config.toml` 的 `[env]`，`build.bat` 自带 PATH/LIBCLANG_PATH，运行时 DLL 由 delvewheel 打进 wheel——新机器无需手工配任何环境变量。
+
 ## 6. 从 PyPI 验证安装
 
 这是验证已发布 wheel 是否能正常工作的最短路径。**所有测试脚本统一使用仓库根目录的 `.venv`（uv 环境）；`uvtest` 只是脚本目录，不单独建环境**（2026-09-05 约定：曾因 uvtest 独立 venv 导致新旧 wheel 混用、基准结果失真，已删除）：
@@ -678,3 +680,4 @@ WIC 注意事项：WPF `CopyPixels` 查询对 alpha HEIC 一律返回 `Bgr32` �
 - **CQ 边界不需要新增 clamp**：下限已有 safeguard 钉 16（防噪声图冲 CQ0 爆体积），上限 51 只在"连 51 都满足 SSIM 目标"时达到（图形桶仅 6.4 MB，无过度压缩证据），外加 keep-smaller 兜底。存储多少的真正旋钮是 `--auto-quality`：**90→88 实测全面占优**（96.5 MB，比固定 CQ20 还少 9.5 MB，同时保留逐图自适应，照片 16–18、图形仍 51）。
 - 大图不必单独固定 CQ20；若语料几乎全是照片且接受轻微质量损失，固定 20 可再省 ~9.5%。
 - **已采纳**：`compress_config.json` 的 `auto_quality` 设为 88（混合图库的标准配置）。
+- **配置与 CLI 默认值的全量对齐（2026-09-06 diff）**：键集一致（26 键），仅两处**有意**不同——`auto_quality: null→88`（本节决策）与 `oversize_max_edge: null→16383`（方案 I3 的显式 opt-in：>16383 超 WebP 硬上限，缩放改像素，故不做 CLI 默认）。其余键与 CLI 默认逐值相等，`src/dst` 为同一默认位置的绝对路径形式。**裸跑（不带 `--config`）= 固定 CQ20、auto 关闭，不是 88**——生产务必带 `--config` 或显式 `--auto-quality 88`。
