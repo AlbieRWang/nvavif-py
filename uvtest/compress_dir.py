@@ -18,6 +18,14 @@ per-image wall time at 512x512). Jobs are submitted slowest-first
 thread-capped so parallel CPU encodes do not thrash (alpha: cores/workers,
 oversize color fallback: cores/oversize-jobs).
 
+Very large runs (100k+ sources) keep the orchestration flat-memory: header
+probes run in a thread pool, at most 4xworkers tasks are in flight (no
+million-future materialization), every finished row is streamed to
+<report>.stream.jsonl so an interrupted run still leaves a per-image
+record, the resource sampler stretches its interval past 20k samples, and
+pool workers are recycled every 10000 tasks. An interrupted run still
+writes the .json report, marked "interrupted": true.
+
 Usage (from the repo root, single root .venv):
     uv run python uvtest/compress_dir.py                       # test_imgs -> out/compressed, auto quality 88
                                                                # (bare-run defaults == compress_config.json)
@@ -75,7 +83,7 @@ import shutil
 import sys
 import threading
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -450,6 +458,7 @@ class ResourceSampler:
     def __init__(self, interval: float = 0.2):
         self.interval = interval
         self.samples: list[dict] = []
+        self._t0 = time.monotonic()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._proc = None
@@ -520,7 +529,15 @@ class ResourceSampler:
                 except Exception:
                     pass
             self.samples.append(sample)
-            self._stop.wait(self.interval)
+            # Bound sampler memory for multi-hour runs: base interval for the
+            # first 20k samples, then stretch x2 per 20k (cap 5 s) — a 12 h
+            # run ends with ~60k samples instead of ~216k.
+            n = len(self.samples)
+            if n < 20000:
+                wait_s = self.interval
+            else:
+                wait_s = min(5.0, self.interval * (1 << (n // 20000)))
+            self._stop.wait(wait_s)
 
     def stop(self) -> dict:
         self._stop.set()
@@ -711,6 +728,15 @@ def main() -> None:
     workers = args.workers or default_workers()
     workers = min(workers, len(files))
 
+    # Header probes in a thread pool: a serial Image.open pass costs ~1-3 ms
+    # per source — 15-50 minutes of dead time before the first encode at 1M
+    # sources. Threads suffice: the work is I/O + Pillow header parsing.
+    if len(files) > 64:
+        with ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 8) * 4)) as tp:
+            probes = list(tp.map(probe_cost, files, chunksize=64))
+    else:
+        probes = [probe_cost(p) for p in files]
+
     tasks = []
     skipped_quality: list[dict] = []
     skipped_animated: list[dict] = []
@@ -741,7 +767,7 @@ def main() -> None:
         # Animated content (GIF — the format is skipped entirely per policy —
         # and animated WebP) is out of scope for the still-image pipeline:
         # whole-image WebP/AVIF would silently flatten it to its first frame.
-        probe = probe_cost(path)
+        probe = probes[i - 1]
         if probe.get("format") == "GIF" or probe.get("animated"):
             reason = "gif" if probe.get("format") == "GIF" else "animated"
             skipped_animated.append({"name": rel.as_posix(), "reason": reason, "src_bytes": path.stat().st_size})
@@ -829,46 +855,98 @@ def main() -> None:
 
     if tasks:
         print(f"encoding {len(tasks)} images with {workers} workers (device={args.device})")
-        with ProcessPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(_encode_task, t): t for t in tasks}
-            for future in as_completed(futures):
-                task = futures[future]
-                tag = f"[{task['index']}/{len(files)}]"
-                try:
-                    result = future.result()
-                    row = result["row"]
-                    rows.append(row)
-                    if row["action"] == "kept_source":
-                        kept_source += 1
-                        kept_src_bytes += row["src_bytes"]
-                        print(
-                            f"{tag} {row['name']}: kept source (AVIF would be "
-                            f"{row['avif_bytes']/1e6:.2f} MB >= source {row['src_bytes']/1e6:.2f} MB)"
-                        )
-                        continue
-                    total_in += row["src_bytes"]
-                    total_out += row["out_bytes"]
-                    total_px += row["megapixels"] * 1e6
-                    print(
-                        f"{tag} {row['name']}: {row['src_bytes']/1e6:.2f} MB -> "
-                        f"{row['out_bytes']/1e6:.2f} MB ({row['ratio']}x), "
-                        f"{row['megapixels']:.1f} MP in {row['encode_s']:.2f} s ({row['mp_per_s']} MP/s)"
-                    )
-                except Exception as exc:  # keep going; report at the end
-                    failures.append(f"{task.get('name', task['path'])}: {exc}")
-                    print(f"{tag} FAIL {task.get('name', task['path'])}: {exc}")
-                    if args.copy_skipped and not args.in_place:
+        stream_f = None
+        if args.report != Path("none"):
+            report_path = args.report if args.report.is_absolute() else args.dst / args.report
+            stream_path = report_path.parent / (report_path.stem + ".stream.jsonl")
+            # Per-row incremental record: survives a crash/interrupt mid-run
+            # (the .json report is only written at the end). 1 MiB buffering
+            # keeps this to one small append per ~500 rows on disk.
+            stream_f = open(stream_path, "w", encoding="utf-8", buffering=1 << 20)
+            stream_f.write(json.dumps({
+                "stream": True, "src": str(args.src), "dst": str(args.dst),
+                "cq": args.cq, "auto_quality": args.auto_quality,
+            }) + "\n")
+        interrupted = False
+        pool = None
+        try:
+            with ProcessPoolExecutor(max_workers=workers, max_tasks_per_child=10000) as pool:
+                # Sliding-window submission: at most 4xworkers tasks in flight,
+                # so a 1M-source run keeps main-process memory flat instead of
+                # materializing a million task dicts + Futures up front (GBs).
+                inflight: dict = {}
+                task_iter = iter(tasks)
+                window = max(workers * 4, 16)
+
+                def _fill():
+                    while len(inflight) < window:
                         try:
-                            # failed source is copied too, so the output folder
-                            # still mirrors the input count — into the source's
-                            # mirrored subfolder (out_path's parent), not the
-                            # output root, which would flatten recursive runs
-                            # and collide same-named sources
-                            fail_dir = Path(task["out_path"]).parent
-                            fail_dir.mkdir(parents=True, exist_ok=True)
-                            shutil.copy2(task["path"], fail_dir / Path(task["path"]).name)
-                        except Exception:
-                            pass
+                            t = next(task_iter)
+                        except StopIteration:
+                            return
+                        try:
+                            fut = pool.submit(_encode_task, t)
+                        except RuntimeError:  # executor broken: stop feeding
+                            return
+                        inflight[fut] = t
+
+                _fill()
+                while inflight:
+                    done, _ = wait(list(inflight), return_when=FIRST_COMPLETED)
+                    for future in done:
+                        task = inflight.pop(future)
+                        tag = f"[{task['index']}/{len(files)}]"
+                        try:
+                            result = future.result()
+                            row = result["row"]
+                            rows.append(row)
+                            if stream_f is not None:
+                                stream_f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                            if row["action"] == "kept_source":
+                                kept_source += 1
+                                kept_src_bytes += row["src_bytes"]
+                                print(
+                                    f"{tag} {row['name']}: kept source (AVIF would be "
+                                    f"{row['avif_bytes']/1e6:.2f} MB >= source {row['src_bytes']/1e6:.2f} MB)"
+                                )
+                                continue
+                            total_in += row["src_bytes"]
+                            total_out += row["out_bytes"]
+                            total_px += row["megapixels"] * 1e6
+                            print(
+                                f"{tag} {row['name']}: {row['src_bytes']/1e6:.2f} MB -> "
+                                f"{row['out_bytes']/1e6:.2f} MB ({row['ratio']}x), "
+                                f"{row['megapixels']:.1f} MP in {row['encode_s']:.2f} s ({row['mp_per_s']} MP/s)"
+                            )
+                        except Exception as exc:  # keep going; report at the end
+                            failures.append(f"{task.get('name', task['path'])}: {exc}")
+                            if stream_f is not None:
+                                stream_f.write(json.dumps({
+                                    "index": task["index"], "name": task.get("name", task["path"]),
+                                    "action": "failed", "error": str(exc),
+                                }, ensure_ascii=False) + "\n")
+                            print(f"{tag} FAIL {task.get('name', task['path'])}: {exc}")
+                            if args.copy_skipped and not args.in_place:
+                                try:
+                                    # failed source is copied too, so the output folder
+                                    # still mirrors the input count — into the source's
+                                    # mirrored subfolder (out_path's parent), not the
+                                    # output root, which would flatten recursive runs
+                                    # and collide same-named sources
+                                    fail_dir = Path(task["out_path"]).parent
+                                    fail_dir.mkdir(parents=True, exist_ok=True)
+                                    shutil.copy2(task["path"], fail_dir / Path(task["path"]).name)
+                                except Exception:
+                                    pass
+                    _fill()
+        except KeyboardInterrupt:
+            interrupted = True
+            if pool is not None:
+                pool.shutdown(wait=False, cancel_futures=True)
+            print("\n[interrupted] queued tasks cancelled; partial report will be written")
+        finally:
+            if stream_f is not None:
+                stream_f.close()
 
     elapsed = time.perf_counter() - started
     resource = sampler.stop()
@@ -916,6 +994,7 @@ def main() -> None:
             "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "src": str(args.src),
             "dst": str(args.dst),
+            **({"interrupted": True} if interrupted else {}),
             "cq": args.cq,
             "auto_quality": args.auto_quality,
             "device": args.device,
@@ -961,6 +1040,9 @@ def main() -> None:
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_text(json.dumps(report, indent=1, ensure_ascii=False), encoding="utf-8")
         print(f"report: {report_path}")
+        if interrupted:
+            print(f"partial run: {len(rows)}/{len(files)} encoded rows recorded; "
+                  f"rerun with the same arguments to resume (existing outputs are skipped)")
 
 
 if __name__ == "__main__":

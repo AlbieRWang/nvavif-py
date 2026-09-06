@@ -681,3 +681,20 @@ WIC 注意事项：WPF `CopyPixels` 查询对 alpha HEIC 一律返回 `Bgr32` �
 - 大图不必单独固定 CQ20；若语料几乎全是照片且接受轻微质量损失，固定 20 可再省 ~9.5%。
 - **已采纳**：`compress_config.json` 的 `auto_quality` 设为 88（混合图库的标准配置）。
 - **CLI 默认值已对齐 config（2026-09-06）**：`--auto-quality` 默认 88、`--oversize-max-edge` 默认 16383（0 = 关），裸跑 = 生产行为；新增 `--fixed-cq` 开关退回固定 `--cq` 基准模式（config 键 `fixed_cq`，旧 config 缺该键 = false，行为不变）。config 与 CLI 默认值全量 diff 为零，`compress_config.json` 只是"生产档位的固化快照"。
+
+## 18. 百万级长跑加固（2026-09-06）
+
+动机：单次运行 1M+ 源（10–20 h 量级）时审计发现编码核心无泄漏（会话缓存有界、逐图对象 RAII 释放），
+但编排层有 4 个 O(语料规模) 增长点和长跑特有风险。compress_dir.py 已加固：
+
+- **滑动窗口提交**：一次性 submit 1M 个 task dict + Future 主进程要 ~2–4 GB；改为在飞 ≤ 4×workers
+  的滑动窗口（`wait(FIRST_COMPLETED)` 收割 + 补位），主进程内存与语料规模无关。
+- **流式报表 `<report>.stream.jsonl`**：逐行追加（1 MiB 缓冲），中断/崩溃也留下已完成部分的逐图记录；
+  正常结束时照旧写完整 .json（Ctrl+C 中断时顶层 `"interrupted": true`，且提示重跑续传——
+  `overwrite=false` 下已完成的输出自动跳过）。
+- **采样器内存上界**：>2 万样本后间隔每 2 万翻倍（上限 5 s）——12 h 长跑从 ~21.6 万条降到 ~6 万条。
+- **worker 定期重生**：`max_tasks_per_child=10000`，防慢泄漏/碎片化的保险（当前核心审计干净，属防御性）。
+- **探针并行化**：串行 `Image.open` 头探针 ~1–3 ms/张 = 1M 源先干等 15–50 分钟；改线程池（>64 文件时启用）。
+- 遗留运维注意（非代码）：图库保持子目录结构（NTFS 单目录百万文件变慢）；输出目录加 Defender 排除；
+  8192 级大图 ×8 worker 的显存峰值可能静默 CPU 回退（报表按 `mp_per_s` 离群检测）；auto 模式
+  workers=8 时 capacity=1 会话复用≈0（每图 ~3 次开上下文 ≈240 ms），可试 workers=4 权衡。

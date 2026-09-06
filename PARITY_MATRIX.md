@@ -63,6 +63,7 @@
 | P2 | 提交顺序 | 头信息代价降序（LPT）：像素量基础，oversize ×200，真透明 ×8 |
 | P3 | rav1e 线程额度 | alpha 读 `NVAVIF_RAV1E_THREADS`（默认 cores/workers），颜色回退读 `NVAVIF_RAV1E_THREADS_COLOR`（默认不设限——实测设限倒退，方案 J） |
 | P4 | 单 worker 失败 | 不中断整批，计入 `summary.failures`，源按 F7 处理 |
+| P5 | 百万级长跑编排 | 头探针线程池并行（>64 文件时启用）；滑动窗口提交（在飞 ≤ 4×workers，主进程内存与语料规模无关）；逐行流式报表 `<report>.stream.jsonl`（中断/崩溃留逐图记录）；采样器 >2 万样本后间隔倍增（上限 5 s）；worker 每 10000 任务重生。Ctrl+C 中断仍写完整格式 .json 报表，顶层多 `"interrupted": true`，重跑同参数即续传 |
 
 ## 5. 报表 schema（`compress_report.json`）
 
@@ -71,7 +72,9 @@ keep_smaller, copy_skipped, in_place, transparent_format, webp_quality, webp_met
 webp_lossless_max_mb, opaque_format, opaque_webp_quality, oversize_format,
 oversize_webp_quality, oversize_webp_method, oversize_max_edge,
 alpha_rav1e_threads, color_rav1e_threads, summary, resource,
-skipped_quality_jpeg[], skipped_animated[], images[]`
+skipped_quality_jpeg[], skipped_animated[], images[]` + 可选 `interrupted`（P5 中断标记）。
+附属文件：`<report>.stream.jsonl`——首行 run 元信息，之后每完成一图一行（同逐图行 schema），
+失败行 `{"index, name, action: "failed", error"}`（P5）。
 
 逐图行（encoded）：`name, action, format, cq, mode, alpha, lossless, width, height, megapixels,
 src_bytes, out_bytes, ratio, bits_per_pixel, encode_s, mp_per_s` + 可选 `resized_from`。
