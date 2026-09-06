@@ -1,14 +1,18 @@
 """One-command batch compression: compress a folder of images to AVIF.
 
 Wraps nvavif_py.encode_file for every image in the source directory.
-Input formats are whatever Pillow opens (PNG/JPEG/WebP/BMP/...);
-transparency is preserved automatically (GPU color + fast CPU alpha).
+Input formats are whatever Pillow opens (PNG/JPEG/WebP/BMP/TIFF/GIF).
+By default, truly transparent images are routed to whole-image WebP
+(lossless alpha, no rav1e involved); opaque images go to AVIF on the GPU.
 
 Images are encoded by a process pool: each worker gets its own NVENC
 session, so GPU color encodes of different images overlap, and CPU alpha
 encodes overlap with GPU color encodes of other images. The worker count
 is capped by the driver's concurrent-NVENC-session limit (~8 on RTX 40
-series); oversized (>8192) images never take the GPU anyway.
+series); oversized (>8192) images never take the GPU anyway. Jobs are
+submitted slowest-first (header-probe cost estimate), and each worker's
+rav1e contexts are thread-capped so parallel CPU encodes do not thrash
+(alpha: cores/workers, oversize color fallback: cores/oversize-jobs).
 
 Usage (from the repo root, single root .venv):
     uv run python uvtest/compress_dir.py                       # test_imgs -> out/compressed
@@ -16,8 +20,25 @@ Usage (from the repo root, single root .venv):
     uv run python uvtest/compress_dir.py --src DIR --dst DIR   # custom folders
     uv run python uvtest/compress_dir.py --auto-quality 80     # SSIM-targeted quality
     uv run python uvtest/compress_dir.py --workers 4           # cap parallelism
-    uv run python uvtest/compress_dir.py --transparent-format webp   # transparent -> WebP (lossless alpha, beat AVIF on the hard-edged transparent set: 3.5 MB/5.0 s vs 6.1 MB/12.3 s)
+    uv run python uvtest/compress_dir.py --transparent-format webp   # transparent -> WebP (default)
     uv run python uvtest/compress_dir.py --copy-skipped        # mirror skipped/kept sources into the output folder
+
+Production config: every option can live in a JSON config file passed with
+--config (CLI flags override the file; unknown keys are rejected). Generate
+a template with the current effective values:
+    uv run python uvtest/compress_dir.py --write-config my_config.json
+
+Routing rules (all tunable):
+    opaque              -> GPU AVIF (NVENC), keep-smaller guard
+    truly transparent   -> whole-image WebP q90 (--transparent-format,
+                           --webp-quality); sources <= --webp-lossless-max-mb
+                           (default 1 MB) use LOSSLESS WebP (same size as
+                           lossy on simple graphics, zero fidelity loss)
+    oversized > 8192    -> whole-image WebP q80 method 2 (--oversize-format,
+                           ~5.9x faster than the rav1e fallback); >16383
+                           (WebP limit) or --oversize-format avif take the
+                           AVIF CPU fallback
+    low-quality JPEGs   -> kept as-is (--min-jpeg-quality)
 """
 
 from __future__ import annotations
@@ -26,6 +47,7 @@ import argparse
 import json
 import os
 import shutil
+import sys
 import threading
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -53,6 +75,13 @@ IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".g
 
 # Driver cap on concurrent NVENC sessions for consumer GPUs (RTX 40 series).
 NVENC_SESSION_LIMIT = 8
+
+# Same NVENC AV1 input cap as src/lib.rs; images beyond it take the all-CPU
+# fallback path, which is orders of magnitude slower per megapixel.
+NVENC_MAX_DIMENSION = 8192
+
+# WebP format limit (Pillow raises above this).
+WEBP_MAX_DIMENSION = 16383
 
 # IJG standard luminance quantization table (the baseline every mainstream
 # JPEG encoder scales to express its quality setting).
@@ -106,6 +135,41 @@ def default_workers() -> int:
     return max(1, min(NVENC_SESSION_LIMIT, (os.cpu_count() or 8) // 2))
 
 
+def probe_cost(path: Path) -> dict:
+    """Relative encode-cost estimate from the image header (no pixel decode).
+
+    Base cost is megapixels, weighted up for the paths that cannot use the
+    GPU: oversize (>8192) images encode entirely on the CPU (~0.16 s/MP
+    measured vs ~0.0003 s/MP on NVENC), transparent images pay an extra CPU
+    rav1e alpha encode. Used only to submit the slowest jobs first
+    (longest-processing-time scheduling) and to size the rav1e thread caps;
+    returns the probe details alongside the cost for those two consumers.
+    """
+    width = height = 0
+    has_alpha = False
+    try:
+        from PIL import Image
+
+        with Image.open(path) as im:
+            width, height = im.width, im.height
+            has_alpha = im.mode in ("RGBA", "LA", "PA") or "transparency" in im.info
+    except Exception:
+        pass
+    if width:
+        cost = width * height / 1e6
+        if width > NVENC_MAX_DIMENSION or height > NVENC_MAX_DIMENSION:
+            cost *= 200.0
+        elif has_alpha:
+            cost *= 8.0
+        return {"cost": cost, "width": width, "height": height, "has_alpha": has_alpha}
+    return {
+        "cost": path.stat().st_size / 1e6,  # unreadable header: fall back to file size
+        "width": 0,
+        "height": 0,
+        "has_alpha": False,
+    }
+
+
 def _encode_task(task: dict) -> dict:
     """Pool worker: encode one image, return a per-image report row."""
     from PIL import Image
@@ -114,58 +178,87 @@ def _encode_task(task: dict) -> dict:
     out_dir = Path(task["out_path"]).parent
     t0 = time.perf_counter()
 
-    # Transparent images can be routed to WebP/PNG instead of AVIF: WebP
-    # codes alpha losslessly, beats AVIF on hard-edged masks (measured
-    # 3.5 MB / 5.0 s vs 6.1 MB / 12.3 s on the transparent test set), and
-    # carries zero rav1e risk. Opaque images stay on the GPU AVIF path.
+    # Whole-image WebP routing covers two cases: (a) transparent images when
+    # --transparent-format is webp/png (WebP codes alpha losslessly and keeps
+    # the entire encode off the CPU rav1e alpha path), and (b) oversized
+    # (>8192) images when --oversize-format is webp (single-threaded WebP is
+    # still ~3x faster and 2-3x smaller than the rav1e CPU fallback, measured
+    # 2026-09-06, see OPTIMIZATION_PROPOSALS I4). Constant-opaque RGBA and
+    # images beyond the WebP 16383 limit stay on the AVIF path.
+    width, height = task["width"], task["height"]
+    oversize = width > NVENC_MAX_DIMENSION or height > NVENC_MAX_DIMENSION
+    whole_format = None  # "webp" | "png": whole-image routing, no AVIF at all
+    quality = None
+    lossless = False
+    transparent_route = False
     fmt = task["transparent_format"]
     if fmt != "avif":
         with Image.open(path) as im:
-            rgba = im.convert("RGBA")
-            alpha_lo, _ = rgba.getchannel("A").getextrema()
+            alpha_lo, _ = im.convert("RGBA").getchannel("A").getextrema()
         if alpha_lo < 255:  # real transparency (constant-opaque stays on AVIF)
-            out_path = out_dir / (path.stem + f".{fmt}")
-            if fmt == "webp":
-                rgba.save(out_path, "WEBP", quality=task["webp_quality"], method=4)
+            whole_format = fmt  # webp or png
+            transparent_route = True
+            quality = task["webp_quality"] if fmt == "webp" else None
+            # Auto-lossless: on simple graphics (small sources) lossless WebP
+            # compresses to the same size as q90 lossy with zero fidelity
+            # loss — measured 2026-09-06 (0.03-0.05 MB either way) — so take
+            # it under the size threshold. Large artwork lossless runs 3-5x
+            # bigger than lossy, so those stay lossy unless the threshold
+            # (--webp-lossless-max-mb) is raised.
+            if whole_format == "webp" and task["webp_lossless_max_mb"] > 0 and path.stat().st_size <= task["webp_lossless_max_mb"] * 1e6:
+                lossless = True
+    if whole_format is None and task["oversize_format"] == "webp" and oversize and max(width, height) <= WEBP_MAX_DIMENSION:
+        whole_format = "webp"
+        quality = task["oversize_webp_quality"]
+
+    if whole_format is not None:
+        # method>=3 runs an exhaustive partition search that explodes on some
+        # large-image content (73.jpg: 42 s vs 2.3 s at method=2 for 10%
+        # smaller output) — the oversize route defaults to method=2.
+        method = task["webp_method"] if transparent_route else task["oversize_webp_method"]
+        out_path = Path(task["out_path"]).with_suffix(f".{whole_format}")
+        with Image.open(path) as im:
+            rgba = im.convert("RGBA")
+            if whole_format == "webp":
+                rgba.save(out_path, "WEBP", quality=quality, lossless=lossless, method=method)
             else:
                 rgba.save(out_path, "PNG")
-            elapsed = time.perf_counter() - t0
-            src_bytes = path.stat().st_size
-            out_bytes = out_path.stat().st_size
-            if task["keep_smaller"] and out_bytes >= src_bytes:
-                out_path.unlink()
-                return {
-                    "ok": True,
-                    "row": {
-                        "name": path.name,
-                        "action": "kept_source",
-                        "format": fmt,
-                        "src_bytes": src_bytes,
-                        "avif_bytes": out_bytes,
-                        "encode_s": round(elapsed, 3),
-                    },
-                }
-            with Image.open(path) as im:
-                width, height, mode = im.width, im.height, im.mode
+        elapsed = time.perf_counter() - t0
+        src_bytes = path.stat().st_size
+        out_bytes = out_path.stat().st_size
+        if task["keep_smaller"] and out_bytes >= src_bytes:
+            out_path.unlink()
             return {
                 "ok": True,
                 "row": {
                     "name": path.name,
-                    "action": "encoded",
-                    "format": fmt,
-                    "mode": mode,
-                    "alpha": True,
-                    "width": width,
-                    "height": height,
-                    "megapixels": round(width * height / 1e6, 3),
+                    "action": "kept_source",
+                    "format": whole_format,
                     "src_bytes": src_bytes,
-                    "out_bytes": out_bytes,
-                    "ratio": round(src_bytes / max(out_bytes, 1), 2),
-                    "bits_per_pixel": round(out_bytes * 8 / max(width * height, 1), 3),
+                    "avif_bytes": out_bytes,
                     "encode_s": round(elapsed, 3),
-                    "mp_per_s": round(width * height / 1e6 / max(elapsed, 1e-6), 2),
                 },
             }
+        return {
+            "ok": True,
+                "row": {
+                    "name": path.name,
+                    "action": "encoded",
+                    "format": whole_format,
+                    "mode": "RGBA",
+                    "alpha": True,
+                    "lossless": lossless,
+                "width": width,
+                "height": height,
+                "megapixels": round(width * height / 1e6, 3),
+                "src_bytes": src_bytes,
+                "out_bytes": out_bytes,
+                "ratio": round(src_bytes / max(out_bytes, 1), 2),
+                "bits_per_pixel": round(out_bytes * 8 / max(width * height, 1), 3),
+                "encode_s": round(elapsed, 3),
+                "mp_per_s": round(width * height / 1e6 / max(elapsed, 1e-6), 2),
+            },
+        }
 
     kwargs = {"device": task["device"]}
     if task["auto_quality"] is not None:
@@ -316,8 +409,11 @@ class ResourceSampler:
         return stats
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--src", type=Path, default=ROOT / "test_imgs", help="source image folder")
     parser.add_argument("--dst", type=Path, default=ROOT / "uvtest" / "out" / "compressed", help="output folder for .avif files")
     parser.add_argument("--cq", type=int, default=20, help="quality 0-51, lower is better (default 20)")
@@ -347,10 +443,38 @@ def main() -> None:
     parser.add_argument(
         "--transparent-format",
         choices=["avif", "webp", "png"],
-        default="avif",
-        help="output format for images with real transparency (default: avif). webp codes alpha losslessly and beat AVIF on the hard-edged transparent test set (3.5 MB/5.0 s vs 6.1 MB/12.3 s)",
+        default="webp",
+        help="output format for images with real transparency (default: webp — codes alpha losslessly, keeps the whole image off the CPU rav1e alpha path, and beat AVIF on the hard-edged transparent test set: 3.5 MB/5.0 s vs 6.1 MB/12.3 s). Constant-opaque RGBA stays on the GPU AVIF path either way",
     )
     parser.add_argument("--webp-quality", type=int, default=90, help="WebP quality 0-100 for --transparent-format webp (default: 90)")
+    parser.add_argument("--webp-method", type=int, default=4, help="libwebp effort 0-6 for transparent WebP (default: 4; small images, quality first)")
+    parser.add_argument(
+        "--webp-lossless-max-mb",
+        type=float,
+        default=1.0,
+        metavar="MB",
+        help="transparent sources at or below this file size use LOSSLESS WebP (measured: on simple graphics lossless compresses to the same size as q90 lossy with zero fidelity loss; large artwork lossless runs 3-5x bigger, so those stay lossy). 0 disables",
+    )
+    parser.add_argument(
+        "--oversize-format",
+        choices=["avif", "webp"],
+        default="webp",
+        help="output format for images beyond the NVENC 8192 cap (default: webp — measured ~5.9x batch speedup and 1/3 the size of the rav1e CPU fallback at SSIM 0.991 vs 0.995, both visually lossless; OPTIMIZATION_PROPOSALS I4). avif keeps the max-fidelity CPU fallback; images beyond the WebP 16383 limit always take the AVIF fallback",
+    )
+    parser.add_argument("--oversize-webp-quality", type=int, default=80, help="WebP quality 0-100 for --oversize-format webp (default: 80)")
+    parser.add_argument("--oversize-webp-method", type=int, default=2, help="libwebp effort for oversized WebP (default: 2; method>=3 explodes on some content: 42 s vs 2.3 s for 10%% smaller output)")
+    parser.add_argument(
+        "--alpha-rav1e-threads",
+        type=int,
+        default=0,
+        help="rav1e thread cap per worker for CPU alpha encodes (default: 0 = auto, cores/workers)",
+    )
+    parser.add_argument(
+        "--color-rav1e-threads",
+        type=int,
+        default=0,
+        help="rav1e thread cap for the CPU color fallback (default: 0 = all cores; measured: capping regresses wall time, OPTIMIZATION_PROPOSALS J)",
+    )
     parser.add_argument("--overwrite", action="store_true", help="re-encode even if the output already exists")
     parser.add_argument(
         "--report",
@@ -358,7 +482,54 @@ def main() -> None:
         default=Path("compress_report.json"),
         help="per-image + resource-usage JSON report, relative to the output folder (default: compress_report.json; 'none' disables)",
     )
-    args = parser.parse_args()
+    parser.add_argument("--config", type=Path, default=None, help="JSON config file; every CLI option can be set there by its long name (e.g. \"cq\": 26). CLI flags override the file")
+    parser.add_argument("--write-config", type=Path, default=None, metavar="PATH", help="write the effective config (defaults + CLI overrides) as JSON to PATH and exit — use it to generate a config template")
+    return parser
+
+
+def apply_config(parser: argparse.ArgumentParser, config_path: Path) -> None:
+    """Load a JSON config and inject it as parser defaults (CLI still wins).
+
+    Keys are the long option names without the leading dashes, values use the
+    same types as the CLI (ints/floats/bools/strings). Unknown keys are an
+    error so a typo'd config can never silently run with wrong defaults.
+    """
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        sys.exit(f"config {config_path}: {exc}")
+    if not isinstance(config, dict):
+        sys.exit(f"config {config_path}: expected a JSON object")
+    by_dest = {action.dest: action for action in parser._actions}
+    for key, value in config.items():
+        action = by_dest.get(key)
+        if action is None or key in ("config", "write_config", "help"):
+            sys.exit(f"config {config_path}: unknown key {key!r} (valid keys: {', '.join(sorted(k for k in by_dest if k not in ('config', 'write_config', 'help')))}')")
+        # set_defaults bypasses argparse type coercion, so apply the action's
+        # type explicitly (matters for ints/floats/Paths from JSON).
+        parser.set_defaults(**{key: action.type(value) if action.type else value})
+
+
+def effective_config(args: argparse.Namespace) -> dict:
+    return {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items() if k not in ("config", "write_config")}
+
+
+def main() -> None:
+    parser = build_parser()
+    argv = sys.argv[1:]
+    # First pass: only resolve --config so the file can seed the defaults; the
+    # second parse then applies CLI overrides on top of them.
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config", type=Path)
+    cfg_args, _ = pre_parser.parse_known_args(argv)
+    if cfg_args.config is not None:
+        apply_config(parser, cfg_args.config)
+    args = parser.parse_args(argv)
+
+    if args.write_config is not None:
+        args.write_config.write_text(json.dumps(effective_config(args), indent=1), encoding="utf-8")
+        print(f"config template written: {args.write_config}")
+        return
 
     files = sorted(p for p in args.src.iterdir() if p.suffix.lower() in IMAGE_SUFFIXES)
     if args.limit:
@@ -407,8 +578,34 @@ def main() -> None:
                 "copy_skipped": args.copy_skipped,
                 "transparent_format": args.transparent_format,
                 "webp_quality": args.webp_quality,
+                "webp_method": args.webp_method,
+                "webp_lossless_max_mb": args.webp_lossless_max_mb,
+                "oversize_format": args.oversize_format,
+                "oversize_webp_quality": args.oversize_webp_quality,
+                "oversize_webp_method": args.oversize_webp_method,
+                **probe_cost(path),
             }
         )
+
+    # Longest job first: a cost-ordered submission keeps every worker busy
+    # through the tail instead of ending with one worker grinding on the
+    # slowest image (CPU-fallback oversize / transparent AVIF encodes).
+    tasks.sort(key=lambda t: t["cost"], reverse=True)
+
+    # Fair-share rav1e threads for the alpha encodes: many short transparent
+    # images across 8 workers would otherwise spin up a full all-cores
+    # context per job and thrash. Only the alpha path is capped — measured
+    # (2026-09-06 full corpus): capping the oversize color fallback strands
+    # idle cores and REGRESSES wall time (45.0 s uncapped -> 54.8 s with
+    # cores/4 jobs, 64.6 s with cores/8), because the total CPU work of the
+    # long oversize jobs is invariant and OS timesharing packs it well; the
+    # per-image slowdown under contention (16 s -> 40 s) does not hurt wall
+    # time. Spawned pool workers inherit the environment variables; 0/absent
+    # keeps the single-process all-cores default.
+    alpha_threads = args.alpha_rav1e_threads or max(1, (os.cpu_count() or 8) // workers)
+    os.environ["NVAVIF_RAV1E_THREADS"] = str(alpha_threads)
+    if args.color_rav1e_threads > 0:
+        os.environ["NVAVIF_RAV1E_THREADS_COLOR"] = str(args.color_rav1e_threads)
 
     total_in = total_out = 0
     total_px = 0
@@ -503,6 +700,13 @@ def main() -> None:
             "copy_skipped": args.copy_skipped,
             "transparent_format": args.transparent_format,
             "webp_quality": args.webp_quality,
+            "webp_method": args.webp_method,
+            "webp_lossless_max_mb": args.webp_lossless_max_mb,
+            "oversize_format": args.oversize_format,
+            "oversize_webp_quality": args.oversize_webp_quality,
+            "oversize_webp_method": args.oversize_webp_method,
+            "alpha_rav1e_threads": alpha_threads,
+            "color_rav1e_threads": args.color_rav1e_threads,
             "summary": {
                 "total": len(files),
                 "encoded": len(enc_rows),

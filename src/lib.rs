@@ -441,6 +441,32 @@ fn cpu_color_preset(preset: i32, width: usize, height: usize) -> i32 {
     }
 }
 
+/// Optional cap on rav1e's internal thread pool, read from environment
+/// variables (0 or unset = all cores, the single-process default):
+/// - `NVAVIF_RAV1E_THREADS` caps monochrome (alpha) encodes;
+/// - `NVAVIF_RAV1E_THREADS_COLOR` caps color CPU encodes (oversize fallback).
+/// When several processes encode in parallel — see the ProcessPoolExecutor in
+/// uvtest/compress_dir.py — every worker letting rav1e grab all cores makes
+/// the CPU encodes thrash each other (measured: a 101.7 MP oversize encode
+/// takes 16 s alone, ~40 s with 8 competing workers). The batch script sets
+/// each cap to cores / (expected concurrent encodes of that kind): the two
+/// caps differ because a handful of long oversize jobs and a stream of short
+/// alpha jobs saturate the machine at different concurrency levels. A hard
+/// cap BELOW cores/concurrency strands idle cores (measured: cap 3 per
+/// oversize encode left 16 of 28 cores idle and made the batch tail 45 s →
+/// 65 s), so the script derives each cap from its own job mix.
+fn rav1e_threads(monochrome: bool) -> usize {
+    let key = if monochrome {
+        "NVAVIF_RAV1E_THREADS"
+    } else {
+        "NVAVIF_RAV1E_THREADS_COLOR"
+    };
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
 /// Software-based AV1 frame encoding using rav1e.
 /// Encoding of YUV pixel data into an AV1 bitstream via CPU.
 /// Mapping of NVENC-style quality (CQ) and speed presets to rav1e quantizer and speed parameters.
@@ -500,7 +526,7 @@ fn encode_av1_frame_cpu(
 
     let mut ctx: rav1e::Context<u16> = rav1e::Config::new()
         .with_encoder_config(enc)
-        .with_threads(0) // Utilization of all CPU cores
+        .with_threads(rav1e_threads(monochrome)) // 0 = all cores; see rav1e_threads()
         .new_context()
         .map_err(|e: rav1e::InvalidConfig| {
             pyo3::exceptions::PyRuntimeError::new_err(e.to_string())

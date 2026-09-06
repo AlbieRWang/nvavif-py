@@ -35,6 +35,7 @@ python-source = "source"
 [dependency-groups]
 dev = [
     "delvewheel",
+    "lpips>=0.1.4",
     "maturin",
     "psutil",
     "pynvml",
