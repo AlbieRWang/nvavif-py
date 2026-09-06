@@ -295,6 +295,11 @@ delvewheel repair dist\*.whl --add-path "ffmpeg-out\bin;C:\msys64\mingw64\bin" -
 
 ## 10. 测试脚本与运行方法
 
+### 10.0 命令行约定（2026-09-06）
+
+- 工作目录在会话内持久：进入仓库根一次之后，后续命令**不要再重复 `cd` 到仓库根**，直接写相对路径（或确需跨目录时用绝对路径）。每个命令前缀 `cd <repo> &&` 属于历史噪音，新命令不应模仿。
+- 临时测试一律建在 `uvtest/out/` 下的临时目录（如 `uvtest/out/_t_xxx`），用完即删；禁止把 `test_imgs/` 当可写目录。
+
 ### 10.1 定向功能回归
 
 脚本：[`uvtest/test_nvavif.py`](O:/Project/Media/nvavif-py/uvtest/test_nvavif.py)
@@ -469,7 +474,7 @@ speed 9 比 speed 8 再快约一倍，文件大约 10%，保真度相当，选�
 
 **已修复（2026-09-06），根因是 rav1e 的 `asm` 特性**： rav1e 0.7.1 的 NASM SIMD 内核在本机工具链（nasm-rs 自编译 NASM）下对硬边、大面积平坦的单色内容（二值 alpha 掩码）产生**静默损坏的重建像素**——Cs420 颜色路径同一内容正常，Cs400 alpha 路径触发；CDEF 的 `cdef.rs:95` debug_assert 是症状不是病因（debug 构建直接 panic，release 构建 assert 被编译掉、静默输出坏码流）。用 ffmpeg 独立解码与 `decode_file()` 错误完全一致，证明容器里的码流本身就是坏的；这也解释了浏览器中透明显示异常（浏览器如实合成坏 alpha）而 Windows 看图软件"黑底正常"（不合成 alpha）。
 
-修复：`Cargo.toml` 中 rav1e 去掉 `asm` feature（`features = ["threading"]`），CDEF/LRF 照常开启。验证（`uvtest/diag_alpha_bug.py`，3 张图）：两张问题图 alpha MAE 153.17/141.47 → **0.05/0.03**，ffmpeg 参考解码一致；10 张透明图全集 61.2 MP 单进程 10.88 s（5.63 MP/s，比 asm 版慢约 10~25%，可接受），最差 alpha MAE 0.054。回归测试固化在 `src/lib.rs` 的 `alpha_dbg_tests`（输入 fixture 由 `diag_alpha_bug.py` 生成，缺失时跳过）。若未来要恢复 asm，需先换可信 NASM 构建并重跑本回归。
+修复：`Cargo.toml` 中 rav1e 去掉 `asm` feature（`features = ["threading"]`），CDEF/LRF 照常开启。验证（一次性诊断脚本 `uvtest/diag_alpha_bug.py`，已随 2026-09-06 清理删除，复现用例固化在 lib.rs 回归测试中；3 张图）：两张问题图 alpha MAE 153.17/141.47 → **0.05/0.03**，ffmpeg 参考解码一致；10 张透明图全集 61.2 MP 单进程 10.88 s（5.63 MP/s，比 asm 版慢约 10~25%，可接受），最差 alpha MAE 0.054。回归测试固化在 `src/lib.rs` 的 `alpha_dbg_tests`（输入 fixture 原由 `diag_alpha_bug.py` 生成，脚本删除后 fixture 缺失时跳过）。若未来要恢复 asm，需先换可信 NASM 构建并重跑本回归。
 
 脚本：`uvtest/bench_alpha_tuning.py`；报告：`uvtest/out/alpha_tuning/*.json`。
 

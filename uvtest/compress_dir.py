@@ -21,7 +21,9 @@ Usage (from the repo root, single root .venv):
     uv run python uvtest/compress_dir.py --auto-quality 80     # SSIM-targeted quality
     uv run python uvtest/compress_dir.py --workers 4           # cap parallelism
     uv run python uvtest/compress_dir.py --transparent-format webp   # transparent -> WebP (default)
-    uv run python uvtest/compress_dir.py --copy-skipped        # mirror skipped/kept sources into the output folder
+    uv run python uvtest/compress_dir.py --copy-skipped        # mirror kept/skipped/failed sources (default on)
+    uv run python uvtest/compress_dir.py --in-place            # replace sources in their own folder
+    uv run python uvtest/compress_dir.py --no-recursive        # scan only the top level (recursive is the default)
 
 Production config: every option can live in a JSON config file passed with
 --config (CLI flags override the file; unknown keys are rejected). Generate
@@ -29,7 +31,8 @@ a template with the current effective values:
     uv run python uvtest/compress_dir.py --write-config my_config.json
 
 Routing rules (all tunable):
-    opaque              -> GPU AVIF (NVENC), keep-smaller guard
+    opaque              -> GPU AVIF (NVENC), keep-smaller guard; or whole-
+                           image WebP with --opaque-format webp
     truly transparent   -> whole-image WebP q90 (--transparent-format,
                            --webp-quality); sources <= --webp-lossless-max-mb
                            (default 1 MB) use LOSSLESS WebP (same size as
@@ -37,8 +40,19 @@ Routing rules (all tunable):
     oversized > 8192    -> whole-image WebP q80 method 2 (--oversize-format,
                            ~5.9x faster than the rav1e fallback); >16383
                            (WebP limit) or --oversize-format avif take the
-                           AVIF CPU fallback
+                           AVIF CPU fallback, unless --oversize-max-edge
+                           resizes the source to fit first (opt-in LANCZOS,
+                           per-image resize recorded in the report)
     low-quality JPEGs   -> kept as-is (--min-jpeg-quality)
+
+Unchanged sources (kept by --keep-smaller, pre-filtered JPEGs, failures) are
+copied into the output folder by default (--copy-skipped) so the output count
+matches the input; --in-place replaces sources in their own folder instead.
+
+The scan is recursive by default and the output mirrors the source's relative
+folder structure. GIF and animated WebP sources are skipped untouched (a
+still-image encode would flatten them to their first frame); animated-image
+support is a possible future feature.
 """
 
 from __future__ import annotations
@@ -70,6 +84,12 @@ for _dll_dir in (
 # would shadow the nvavif_py wheel installed in the root .venv.
 
 import nvavif_py as nv  # noqa: E402
+from PIL import Image  # noqa: E402
+
+# Sources beyond Pillow's default ~89 MP "decompression bomb" guard are
+# legitimate inputs here (oversized photography; --oversize-max-edge even
+# requires decoding them to resize).
+Image.MAX_IMAGE_PIXELS = None
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".gif"}
 
@@ -147,12 +167,16 @@ def probe_cost(path: Path) -> dict:
     """
     width = height = 0
     has_alpha = False
+    img_format = None
+    animated = False
     try:
         from PIL import Image
 
         with Image.open(path) as im:
             width, height = im.width, im.height
             has_alpha = im.mode in ("RGBA", "LA", "PA") or "transparency" in im.info
+            img_format = im.format
+            animated = bool(getattr(im, "is_animated", False))
     except Exception:
         pass
     if width:
@@ -161,12 +185,14 @@ def probe_cost(path: Path) -> dict:
             cost *= 200.0
         elif has_alpha:
             cost *= 8.0
-        return {"cost": cost, "width": width, "height": height, "has_alpha": has_alpha}
+        return {"cost": cost, "width": width, "height": height, "has_alpha": has_alpha, "format": img_format, "animated": animated}
     return {
         "cost": path.stat().st_size / 1e6,  # unreadable header: fall back to file size
         "width": 0,
         "height": 0,
         "has_alpha": False,
+        "format": img_format,
+        "animated": animated,
     }
 
 
@@ -175,8 +201,13 @@ def _encode_task(task: dict) -> dict:
     from PIL import Image
 
     path = Path(task["path"])
+    in_place = task["in_place"]
+    display_name = task.get("name") or path.name
     out_dir = Path(task["out_path"]).parent
     t0 = time.perf_counter()
+    # Capture BEFORE any in-place overwrite — after writing, stat() would
+    # return the new (compressed) file's size and break the keep-smaller guard.
+    src_bytes = path.stat().st_size
 
     # Whole-image WebP routing covers two cases: (a) transparent images when
     # --transparent-format is webp/png (WebP codes alpha losslessly and keeps
@@ -187,6 +218,20 @@ def _encode_task(task: dict) -> dict:
     # images beyond the WebP 16383 limit stay on the AVIF path.
     width, height = task["width"], task["height"]
     oversize = width > NVENC_MAX_DIMENSION or height > NVENC_MAX_DIMENSION
+    # --oversize-max-edge: opt-in resize of sources whose longer edge exceeds
+    # the limit (typically the WebP 16383 cap) down to fit, so they take the
+    # fast whole-image WebP route instead of the 40 s-class AVIF CPU fallback.
+    # AVIF routes (--oversize-format avif / --transparent-format avif) keep
+    # full resolution by design; width/height below refer to the ENCODED
+    # dimensions from here on.
+    resize_limit = task["oversize_max_edge"]
+    orig_width, orig_height = width, height
+    need_resize = bool(resize_limit) and max(width, height) > resize_limit
+    if need_resize:
+        scale = resize_limit / max(orig_width, orig_height)
+        width = max(1, int(orig_width * scale))
+        height = max(1, int(orig_height * scale))
+    webp_fits = max(width, height) <= WEBP_MAX_DIMENSION
     whole_format = None  # "webp" | "png": whole-image routing, no AVIF at all
     quality = None
     lossless = False
@@ -195,7 +240,10 @@ def _encode_task(task: dict) -> dict:
     if fmt != "avif":
         with Image.open(path) as im:
             alpha_lo, _ = im.convert("RGBA").getchannel("A").getextrema()
-        if alpha_lo < 255:  # real transparency (constant-opaque stays on AVIF)
+        if alpha_lo < 255 and (fmt == "png" or webp_fits):
+            # real transparency (constant-opaque stays on AVIF); a webp
+            # transparent route beyond the 16383 cap falls through to AVIF
+            # unless --oversize-max-edge resized it to fit
             whole_format = fmt  # webp or png
             transparent_route = True
             quality = task["webp_quality"] if fmt == "webp" else None
@@ -207,47 +255,83 @@ def _encode_task(task: dict) -> dict:
             # (--webp-lossless-max-mb) is raised.
             if whole_format == "webp" and task["webp_lossless_max_mb"] > 0 and path.stat().st_size <= task["webp_lossless_max_mb"] * 1e6:
                 lossless = True
-    if whole_format is None and task["oversize_format"] == "webp" and oversize and max(width, height) <= WEBP_MAX_DIMENSION:
+    if whole_format is None and task["oversize_format"] == "webp" and oversize and webp_fits:
         whole_format = "webp"
         quality = task["oversize_webp_quality"]
+
+    if whole_format is None and task["opaque_format"] == "webp" and not oversize and webp_fits:
+        # Opaque images routed to WebP (experiment/comparison route; the AVIF
+        # NVENC path stays the default). Oversize images are excluded — they
+        # are governed by --oversize-format above.
+        whole_format = "webp"
+        quality = task["opaque_webp_quality"]
 
     if whole_format is not None:
         # method>=3 runs an exhaustive partition search that explodes on some
         # large-image content (73.jpg: 42 s vs 2.3 s at method=2 for 10%
-        # smaller output) — the oversize route defaults to method=2.
-        method = task["webp_method"] if transparent_route else task["oversize_webp_method"]
+        # smaller output) — the oversize route defaults to method=2. The
+        # opaque webp route is GPU-eligible-size, so quality-first method=4.
+        method = task["webp_method"] if (transparent_route or not oversize) else task["oversize_webp_method"]
         out_path = Path(task["out_path"]).with_suffix(f".{whole_format}")
         with Image.open(path) as im:
             rgba = im.convert("RGBA")
-            if whole_format == "webp":
-                rgba.save(out_path, "WEBP", quality=quality, lossless=lossless, method=method)
+            if need_resize:
+                rgba = rgba.resize((width, height), Image.LANCZOS)
+            if in_place:
+                # Write-then-replace via a temp file: a .png/.webp source can
+                # share its name with the output, and a failed encode must
+                # never take the original down with it.
+                tmp_path = out_path.with_name(out_path.stem + ".tmp" + out_path.suffix)
+                if whole_format == "webp":
+                    rgba.save(tmp_path, "WEBP", quality=quality, lossless=lossless, method=method)
+                else:
+                    rgba.save(tmp_path, "PNG")
+                out_bytes = tmp_path.stat().st_size
+                if task["keep_smaller"] and out_bytes >= src_bytes:
+                    tmp_path.unlink()
+                    return {
+                        "ok": True,
+                        "row": {
+                            "name": display_name,
+                            "action": "kept_source",
+                            "format": whole_format,
+                            "src_bytes": src_bytes,
+                            "avif_bytes": out_bytes,
+                            "encode_s": round(time.perf_counter() - t0, 3),
+                        },
+                    }
+                os.replace(tmp_path, out_path)
+                if path.resolve() != out_path.resolve():
+                    path.unlink()
             else:
-                rgba.save(out_path, "PNG")
+                if whole_format == "webp":
+                    rgba.save(out_path, "WEBP", quality=quality, lossless=lossless, method=method)
+                else:
+                    rgba.save(out_path, "PNG")
+                out_bytes = out_path.stat().st_size
+                if task["keep_smaller"] and out_bytes >= src_bytes:
+                    out_path.unlink()
+                    return {
+                        "ok": True,
+                        "row": {
+                            "name": display_name,
+                            "action": "kept_source",
+                            "format": whole_format,
+                            "src_bytes": src_bytes,
+                            "avif_bytes": out_bytes,
+                            "encode_s": round(time.perf_counter() - t0, 3),
+                        },
+                    }
         elapsed = time.perf_counter() - t0
-        src_bytes = path.stat().st_size
-        out_bytes = out_path.stat().st_size
-        if task["keep_smaller"] and out_bytes >= src_bytes:
-            out_path.unlink()
-            return {
-                "ok": True,
-                "row": {
-                    "name": path.name,
-                    "action": "kept_source",
-                    "format": whole_format,
-                    "src_bytes": src_bytes,
-                    "avif_bytes": out_bytes,
-                    "encode_s": round(elapsed, 3),
-                },
-            }
         return {
             "ok": True,
-                "row": {
-                    "name": path.name,
-                    "action": "encoded",
-                    "format": whole_format,
-                    "mode": "RGBA",
-                    "alpha": True,
-                    "lossless": lossless,
+            "row": {
+                "name": display_name,
+                "action": "encoded",
+                "format": whole_format,
+                "mode": "RGBA",
+                "alpha": True,
+                "lossless": lossless,
                 "width": width,
                 "height": height,
                 "megapixels": round(width * height / 1e6, 3),
@@ -257,6 +341,7 @@ def _encode_task(task: dict) -> dict:
                 "bits_per_pixel": round(out_bytes * 8 / max(width * height, 1), 3),
                 "encode_s": round(elapsed, 3),
                 "mp_per_s": round(width * height / 1e6 / max(elapsed, 1e-6), 2),
+                **({"resized_from": [orig_width, orig_height]} if need_resize else {}),
             },
         }
 
@@ -271,16 +356,16 @@ def _encode_task(task: dict) -> dict:
     # Guard: never store something bigger than the source. The source stays
     # wherever it is, so "keeping" it costs zero additional bytes.
     out_path = Path(task["out_path"])
-    if task["keep_smaller"] and len(data) >= path.stat().st_size:
-        if task["copy_skipped"]:
+    if task["keep_smaller"] and len(data) >= src_bytes:
+        if task["copy_skipped"] and not in_place:
             shutil.copy2(path, out_path.parent / path.name)
         return {
             "ok": True,
             "row": {
-                "name": path.name,
+                "name": display_name,
                 "action": "kept_source",
                 "format": "avif",
-                "src_bytes": path.stat().st_size,
+                "src_bytes": src_bytes,
                 "avif_bytes": len(data),
                 "encode_s": round(elapsed, 3),
             },
@@ -289,11 +374,12 @@ def _encode_task(task: dict) -> dict:
 
     with Image.open(path) as im:
         width, height, mode = im.width, im.height, im.mode
-    src_bytes = path.stat().st_size
+    if in_place:
+        path.unlink()  # output suffix (.avif) never equals a source suffix
     return {
         "ok": True,
         "row": {
-            "name": path.name,
+            "name": display_name,
             "action": "encoded",
             "format": "avif",
             "mode": mode,
@@ -415,6 +501,12 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--src", type=Path, default=ROOT / "test_imgs", help="source image folder")
+    parser.add_argument(
+        "--recursive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="recurse into subfolders and mirror the relative structure in the output folder (default: on; --no-recursive scans only the top level)",
+    )
     parser.add_argument("--dst", type=Path, default=ROOT / "uvtest" / "out" / "compressed", help="output folder for .avif files")
     parser.add_argument("--cq", type=int, default=20, help="quality 0-51, lower is better (default 20)")
     parser.add_argument("--auto-quality", type=float, default=None, metavar="TARGET", help="enable auto_cq with this 0-100 quality target instead of --cq")
@@ -437,8 +529,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--copy-skipped",
         action=argparse.BooleanOptionalAction,
+        default=True,
+        help="copy kept/skipped/failed sources unchanged into the output folder so the output count matches the input set (default: on); ignored with --in-place",
+    )
+    parser.add_argument(
+        "--in-place",
+        action="store_true",
         default=False,
-        help="copy skipped/kept sources unchanged into the output folder so it mirrors the input set (default: off)",
+        help="compress in place: replace each source file with its compressed output (originals are only removed after a successful, smaller encode; kept/skipped sources stay untouched). Overrides --dst; --copy-skipped is a no-op",
     )
     parser.add_argument(
         "--transparent-format",
@@ -463,6 +561,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--oversize-webp-quality", type=int, default=80, help="WebP quality 0-100 for --oversize-format webp (default: 80)")
     parser.add_argument("--oversize-webp-method", type=int, default=2, help="libwebp effort for oversized WebP (default: 2; method>=3 explodes on some content: 42 s vs 2.3 s for 10%% smaller output)")
+    parser.add_argument(
+        "--opaque-format",
+        choices=["avif", "webp"],
+        default="avif",
+        help="output format for opaque (incl. constant-opaque RGBA) GPU-eligible images (default: avif — NVENC GPU color encode). webp routes them to whole-image WebP (--opaque-webp-quality, libwebp effort from --webp-method): pure CPU, no GPU involved",
+    )
+    parser.add_argument("--opaque-webp-quality", type=int, default=90, help="WebP quality 0-100 for --opaque-format webp (default: 90)")
+    parser.add_argument(
+        "--oversize-max-edge",
+        type=int,
+        default=None,
+        metavar="N",
+        help="resize sources whose longer edge exceeds N (LANCZOS, aspect kept) so they take the fast whole-image WebP route instead of the AVIF CPU fallback, e.g. 16383 (the WebP limit). Default: off — full resolution kept. AVIF routes (--oversize-format avif) ignore this. Measured: LANCZOS resize of a 101.7 MP source is ~2.3 s vs the 40 s-class CPU AVIF fallback; every resized image is recorded via 'resized_from' in the report",
+    )
     parser.add_argument(
         "--alpha-rav1e-threads",
         type=int,
@@ -506,8 +618,10 @@ def apply_config(parser: argparse.ArgumentParser, config_path: Path) -> None:
         if action is None or key in ("config", "write_config", "help"):
             sys.exit(f"config {config_path}: unknown key {key!r} (valid keys: {', '.join(sorted(k for k in by_dest if k not in ('config', 'write_config', 'help')))}')")
         # set_defaults bypasses argparse type coercion, so apply the action's
-        # type explicitly (matters for ints/floats/Paths from JSON).
-        parser.set_defaults(**{key: action.type(value) if action.type else value})
+        # type explicitly (matters for ints/floats/Paths from JSON). JSON null
+        # means "use the CLI default" for optional args (auto_quality, limit,
+        # workers...) — no value to coerce.
+        parser.set_defaults(**{key: None if value is None else (action.type(value) if action.type else value)})
 
 
 def effective_config(args: argparse.Namespace) -> dict:
@@ -531,59 +645,94 @@ def main() -> None:
         print(f"config template written: {args.write_config}")
         return
 
-    files = sorted(p for p in args.src.iterdir() if p.suffix.lower() in IMAGE_SUFFIXES)
+    scan = args.src.rglob("*") if args.recursive else args.src.iterdir()
+    files = sorted(p for p in scan if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES)
     if args.limit:
         files = files[: args.limit]
     if not files:
-        print(f"no images found in {args.src}")
+        hint = "" if args.recursive else " (subfolders exist? they are included by default; you passed --no-recursive)"
+        print(f"no images found in {args.src}{hint}")
         return
+    if args.in_place:
+        args.dst = args.src  # outputs replace the sources in their own folder
     args.dst.mkdir(parents=True, exist_ok=True)
     workers = args.workers or default_workers()
     workers = min(workers, len(files))
 
     tasks = []
     skipped_quality: list[dict] = []
-    seen_stems: set[str] = set()
+    skipped_animated: list[dict] = []
+    seen_stems: dict[Path, set] = {}
     out_exts = ("avif", "webp", "png")
     for i, path in enumerate(files, 1):
-        # Suffix collision guard: a.png and a.jpg would otherwise write the
-        # same output name — disambiguate the later one by source suffix.
+        rel = path.relative_to(args.src)
+        out_dir = args.dst / rel.parent
+        # Suffix collision guard: a.png and a.jpg in the SAME folder would
+        # otherwise write the same output name — disambiguate the later one
+        # by source suffix. Different subfolders may reuse stems freely.
         stem = path.stem
-        if stem in seen_stems:
+        dir_stems = seen_stems.setdefault(rel.parent, set())
+        if stem in dir_stems:
             stem = f"{path.stem}_{path.suffix.strip('.')}"
-        seen_stems.add(stem)
-        out_path = args.dst / (stem + ".avif")
-        if not args.overwrite and any((args.dst / f"{stem}.{e}").exists() for e in out_exts):
-            print(f"[{i}/{len(files)}] skip (exists): {stem}.*")
+        dir_stems.add(stem)
+        out_path = out_dir / (stem + ".avif")
+        if not args.overwrite:
+            # In-place: exclude the source file itself, or a png/webp source
+            # would always "already exist" under the output suffix set.
+            exists = any(
+                (p := out_path.with_suffix(f".{e}")).exists() and (not args.in_place or p.resolve() != path.resolve())
+                for e in out_exts
+            )
+            if exists:
+                print(f"[{i}/{len(files)}] skip (exists): {rel.as_posix()}.*")
+                continue
+        # Animated content (GIF — the format is skipped entirely per policy —
+        # and animated WebP) is out of scope for the still-image pipeline:
+        # whole-image WebP/AVIF would silently flatten it to its first frame.
+        probe = probe_cost(path)
+        if probe.get("format") == "GIF" or probe.get("animated"):
+            reason = "gif" if probe.get("format") == "GIF" else "animated"
+            skipped_animated.append({"name": rel.as_posix(), "reason": reason, "src_bytes": path.stat().st_size})
+            if args.copy_skipped and not args.in_place:
+                out_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path, out_dir / path.name)
+            print(f"[{i}/{len(files)}] skip ({reason}): {rel.as_posix()}")
             continue
         # Pre-filter: a JPEG already compressed harder than our cq target can
         # only grow or waste encode time — keep it and move on (zero cost).
         if args.min_jpeg_quality > 0 and path.suffix.lower() in (".jpg", ".jpeg"):
             q = estimate_jpeg_quality(path)
             if 0 < q < args.min_jpeg_quality:
-                if args.copy_skipped:
-                    shutil.copy2(path, args.dst / path.name)
-                skipped_quality.append({"name": path.name, "estimated_quality": q, "src_bytes": path.stat().st_size})
-                print(f"[{i}/{len(files)}] skip (source JPEG quality ~{q:.0f} < {args.min_jpeg_quality:.0f}): {path.name}")
+                if args.copy_skipped and not args.in_place:
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(path, out_dir / path.name)
+                skipped_quality.append({"name": rel.as_posix(), "estimated_quality": q, "src_bytes": path.stat().st_size})
+                print(f"[{i}/{len(files)}] skip (source JPEG quality ~{q:.0f} < {args.min_jpeg_quality:.0f}): {rel.as_posix()}")
                 continue
+        out_dir.mkdir(parents=True, exist_ok=True)
         tasks.append(
             {
                 "index": i,
                 "path": str(path),
+                "name": rel.as_posix(),
                 "out_path": str(out_path),
                 "cq": args.cq,
                 "auto_quality": args.auto_quality,
                 "device": args.device,
                 "keep_smaller": args.keep_smaller,
-                "copy_skipped": args.copy_skipped,
+                "copy_skipped": args.copy_skipped and not args.in_place,
+                "in_place": args.in_place,
                 "transparent_format": args.transparent_format,
                 "webp_quality": args.webp_quality,
                 "webp_method": args.webp_method,
                 "webp_lossless_max_mb": args.webp_lossless_max_mb,
+                "opaque_format": args.opaque_format,
+                "opaque_webp_quality": args.opaque_webp_quality,
                 "oversize_format": args.oversize_format,
                 "oversize_webp_quality": args.oversize_webp_quality,
                 "oversize_webp_method": args.oversize_webp_method,
-                **probe_cost(path),
+                "oversize_max_edge": args.oversize_max_edge,
+                **probe,
             }
         )
 
@@ -647,22 +796,33 @@ def main() -> None:
                         f"{row['megapixels']:.1f} MP in {row['encode_s']:.2f} s ({row['mp_per_s']} MP/s)"
                     )
                 except Exception as exc:  # keep going; report at the end
-                    failures.append(f"{Path(task['path']).name}: {exc}")
-                    print(f"{tag} FAIL {Path(task['path']).name}: {exc}")
+                    failures.append(f"{task.get('name', task['path'])}: {exc}")
+                    print(f"{tag} FAIL {task.get('name', task['path'])}: {exc}")
+                    if args.copy_skipped and not args.in_place:
+                        try:  # failed source is copied too, so the output
+                            # folder still mirrors the input count
+                            shutil.copy2(task["path"], args.dst / Path(task["path"]).name)
+                        except Exception:
+                            pass
 
     elapsed = time.perf_counter() - started
     resource = sampler.stop()
 
     n = len(rows)
     rows.sort(key=lambda r: r["name"])
+    n_resized = sum(1 for r in rows if r.get("resized_from"))
     print("\n=== summary ===")
     print(f"encoded {sum(1 for r in rows if r['action'] == 'encoded')}/{len(files)} images in {elapsed:.1f} s ({workers} workers)")
+    if n_resized:
+        print(f"resized: {n_resized} sources with longer edge > {args.oversize_max_edge} (LANCZOS, originals in 'resized_from')")
     if skipped_quality:
         print(f"pre-filter: {len(skipped_quality)} JPEG sources below quality {args.min_jpeg_quality:.0f} kept as-is")
+    if skipped_animated:
+        print(f"animated: {len(skipped_animated)} GIF/animated-WebP sources skipped (still-image pipeline)")
     if kept_source:
         print(f"guard: {kept_source} images kept as source (AVIF was not smaller)")
-    if args.copy_skipped and (kept_source or skipped_quality):
-        print(f"copy-skipped: {kept_source + len(skipped_quality)} sources copied unchanged into the output folder")
+    if args.copy_skipped and not args.in_place and (kept_source or skipped_quality or skipped_animated):
+        print(f"copy-skipped: {kept_source + len(skipped_quality) + len(skipped_animated)} sources copied unchanged into the output folder")
     if total_px:
         print(
             f"encoded: {total_px/1e6:.1f} MP, throughput {total_px/1e6/max(elapsed,1e-6):.2f} MP/s, "
@@ -697,14 +857,18 @@ def main() -> None:
             "workers": workers,
             "min_jpeg_quality": args.min_jpeg_quality,
             "keep_smaller": args.keep_smaller,
-            "copy_skipped": args.copy_skipped,
+            "copy_skipped": args.copy_skipped and not args.in_place,
+            "in_place": args.in_place,
             "transparent_format": args.transparent_format,
             "webp_quality": args.webp_quality,
             "webp_method": args.webp_method,
             "webp_lossless_max_mb": args.webp_lossless_max_mb,
+            "opaque_format": args.opaque_format,
+            "opaque_webp_quality": args.opaque_webp_quality,
             "oversize_format": args.oversize_format,
             "oversize_webp_quality": args.oversize_webp_quality,
             "oversize_webp_method": args.oversize_webp_method,
+            "oversize_max_edge": args.oversize_max_edge,
             "alpha_rav1e_threads": alpha_threads,
             "color_rav1e_threads": args.color_rav1e_threads,
             "summary": {
@@ -712,6 +876,8 @@ def main() -> None:
                 "encoded": len(enc_rows),
                 "kept_source_bigger": kept_source,
                 "skipped_low_quality_jpeg": len(skipped_quality),
+                "skipped_animated": len(skipped_animated),
+                "resized": n_resized,
                 "elapsed_s": round(elapsed, 2),
                 "total_megapixels": round(total_px / 1e6, 2),
                 "aggregate_mp_per_s": round(total_px / 1e6 / max(elapsed, 1e-6), 2),
@@ -723,6 +889,7 @@ def main() -> None:
             },
             "resource": resource,
             "skipped_quality_jpeg": skipped_quality,
+            "skipped_animated": skipped_animated,
             "images": rows,
         }
         report_path.parent.mkdir(parents=True, exist_ok=True)
