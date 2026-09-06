@@ -680,4 +680,4 @@ WIC 注意事项：WPF `CopyPixels` 查询对 alpha HEIC 一律返回 `Bgr32` �
 - **CQ 边界不需要新增 clamp**：下限已有 safeguard 钉 16（防噪声图冲 CQ0 爆体积），上限 51 只在"连 51 都满足 SSIM 目标"时达到（图形桶仅 6.4 MB，无过度压缩证据），外加 keep-smaller 兜底。存储多少的真正旋钮是 `--auto-quality`：**90→88 实测全面占优**（96.5 MB，比固定 CQ20 还少 9.5 MB，同时保留逐图自适应，照片 16–18、图形仍 51）。
 - 大图不必单独固定 CQ20；若语料几乎全是照片且接受轻微质量损失，固定 20 可再省 ~9.5%。
 - **已采纳**：`compress_config.json` 的 `auto_quality` 设为 88（混合图库的标准配置）。
-- **配置与 CLI 默认值的全量对齐（2026-09-06 diff）**：键集一致（26 键），仅两处**有意**不同——`auto_quality: null→88`（本节决策）与 `oversize_max_edge: null→16383`（方案 I3 的显式 opt-in：>16383 超 WebP 硬上限，缩放改像素，故不做 CLI 默认）。其余键与 CLI 默认逐值相等，`src/dst` 为同一默认位置的绝对路径形式。**裸跑（不带 `--config`）= 固定 CQ20、auto 关闭，不是 88**——生产务必带 `--config` 或显式 `--auto-quality 88`。
+- **CLI 默认值已对齐 config（2026-09-06）**：`--auto-quality` 默认 88、`--oversize-max-edge` 默认 16383（0 = 关），裸跑 = 生产行为；新增 `--fixed-cq` 开关退回固定 `--cq` 基准模式（config 键 `fixed_cq`，旧 config 缺该键 = false，行为不变）。config 与 CLI 默认值全量 diff 为零，`compress_config.json` 只是"生产档位的固化快照"。

@@ -87,13 +87,15 @@ encoded_ratio, final_store_mb, failures`。
 
 ## 6. CLI 面（完整清单，`--write-config` 生成的键集）
 
-src, recursive, dst, cq, auto-quality, device, workers, limit, min-jpeg-quality,
+src, recursive, dst, cq, fixed-cq, auto-quality, device, workers, limit, min-jpeg-quality,
 keep-smaller, copy-skipped, in-place, transparent-format, webp-quality, webp-method,
 webp-lossless-max-mb, oversize-format, oversize-webp-quality, oversize-webp-method,
 opaque-format, opaque-webp-quality, oversize-max-edge, alpha-rav1e-threads,
 color-rav1e-threads, overwrite, report, config, write-config
 
 约定：CLI 传参 > config 文件 > 默认值；config 未知键必须报错；JSON null = 用默认。
+**CLI 默认值与 `compress_config.json` 对齐（2026-09-06）**：`auto-quality` 默认 88（`--fixed-cq`
+退回固定 `--cq` 基准模式），`oversize-max-edge` 默认 16383（0 = 关，不缩放）；裸跑 = 生产行为。
 
 ## 7. 已知边界（parity 目标之外，显式记录）
 

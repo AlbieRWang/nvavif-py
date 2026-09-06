@@ -19,12 +19,11 @@ thread-capped so parallel CPU encodes do not thrash (alpha: cores/workers,
 oversize color fallback: cores/oversize-jobs).
 
 Usage (from the repo root, single root .venv):
-    uv run python uvtest/compress_dir.py                       # test_imgs -> out/compressed
-    uv run python uvtest/compress_dir.py --cq 26               # web-quality preset
+    uv run python uvtest/compress_dir.py                       # test_imgs -> out/compressed, auto quality 88
+                                                               # (bare-run defaults == compress_config.json)
     uv run python uvtest/compress_dir.py --src DIR --dst DIR   # custom folders
-    uv run python uvtest/compress_dir.py --auto-quality 88     # SSIM-targeted quality
-                                                               # (88 = measured storage/quality sweet spot on
-                                                               # mixed galleries; the default in compress_config.json)
+    uv run python uvtest/compress_dir.py --auto-quality 85     # different SSIM target
+    uv run python uvtest/compress_dir.py --fixed-cq --cq 26    # fixed-CQ benchmark mode (no calibration)
     uv run python uvtest/compress_dir.py --workers 4           # cap parallelism
     uv run python uvtest/compress_dir.py --transparent-format webp   # transparent -> WebP (default)
     uv run python uvtest/compress_dir.py --copy-skipped        # mirror kept/skipped/failed sources (default on)
@@ -552,8 +551,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="recurse into subfolders and mirror the relative structure in the output folder (default: on; --no-recursive scans only the top level)",
     )
     parser.add_argument("--dst", type=Path, default=ROOT / "uvtest" / "out" / "compressed", help="output folder for .avif files")
-    parser.add_argument("--cq", type=int, default=20, help="quality 0-51, lower is better (default 20)")
-    parser.add_argument("--auto-quality", type=float, default=None, metavar="TARGET", help="enable auto_cq with this 0-100 quality target instead of --cq")
+    parser.add_argument("--cq", type=int, default=20, help="fixed quality 0-51, lower is better (default 20); only used with --fixed-cq")
+    parser.add_argument("--auto-quality", type=float, default=88.0, metavar="TARGET", help="auto_cq SSIM target on the 0-100 scale (default: 88, the measured storage/quality sweet spot on mixed galleries); per-image calibrated CQ is recorded in the report")
+    parser.add_argument(
+        "--fixed-cq",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="disable auto-CQ calibration and encode opaque images at the fixed --cq (benchmark mode; default: auto)",
+    )
     parser.add_argument("--device", choices=["auto", "gpu", "cpu"], default="auto")
     parser.add_argument("--workers", type=int, default=None, help="parallel encode processes (default: min(8, cores/2); NVENC session limit is the hard cap)")
     parser.add_argument("--limit", type=int, default=None, help="only process the first N images (smoke test)")
@@ -615,9 +620,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--oversize-max-edge",
         type=int,
-        default=None,
+        default=16383,
         metavar="N",
-        help="resize sources whose longer edge exceeds N (LANCZOS, aspect kept) so they take the fast whole-image WebP route instead of the AVIF CPU fallback, e.g. 16383 (the WebP limit). Default: off — full resolution kept. AVIF routes (--oversize-format avif) ignore this. Measured: LANCZOS resize of a 101.7 MP source is ~2.3 s vs the 40 s-class CPU AVIF fallback; every resized image is recorded via 'resized_from' in the report",
+        help="resize sources whose longer edge exceeds N (LANCZOS, aspect kept) so they take the fast whole-image WebP route instead of the AVIF CPU fallback (default: 16383, the WebP limit; 0 = off, full resolution kept). AVIF routes (--oversize-format avif) ignore this. Measured: LANCZOS resize of a 101.7 MP source is ~2.3 s vs the 40 s-class CPU AVIF fallback; every resized image is recorded via 'resized_from' in the report",
     )
     parser.add_argument(
         "--alpha-rav1e-threads",
@@ -688,6 +693,9 @@ def main() -> None:
         args.write_config.write_text(json.dumps(effective_config(args), indent=1), encoding="utf-8")
         print(f"config template written: {args.write_config}")
         return
+
+    if args.fixed_cq:
+        args.auto_quality = None  # benchmark mode: fixed --cq, no calibration
 
     scan = args.src.rglob("*") if args.recursive else args.src.iterdir()
     files = sorted(p for p in scan if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES)
