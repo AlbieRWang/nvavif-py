@@ -3,7 +3,7 @@
  "recursive": true,
  "dst": "O:\\Project\\Media\\nvavif-py\\uvtest\\out\\compressed",
  "cq": 20,
- "auto_quality": null,
+ "auto_quality": 88,
  "device": "auto",
  "workers": null,
  "limit": null,

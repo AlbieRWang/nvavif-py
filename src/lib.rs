@@ -467,6 +467,15 @@ fn rav1e_threads(monochrome: bool) -> usize {
         .unwrap_or(0)
 }
 
+/// Per-call stderr timing for the fixed per-encode overhead that a persistent
+/// encoder (session reuse) could remove, gated by NVAVIF_DEBUG_TIMING=1.
+/// The ctx_open share of per-image wall time decides OPTIMIZATION_PROPOSALS Q;
+/// any persistent-session design must also respect the ~8 concurrent-session
+/// driver cap shared across pool workers.
+fn debug_timing_enabled() -> bool {
+    std::env::var("NVAVIF_DEBUG_TIMING").as_deref() == Ok("1")
+}
+
 /// Software-based AV1 frame encoding using rav1e.
 /// Encoding of YUV pixel data into an AV1 bitstream via CPU.
 /// Mapping of NVENC-style quality (CQ) and speed presets to rav1e quantizer and speed parameters.
@@ -601,17 +610,56 @@ fn encode_av1_frame_cpu(
     Ok(out)
 }
 
-/// AV1 encoding of a single YUV frame via NVIDIA hardware acceleration (NVENC).
-/// Configuration of the encoder context for intra-only processing, zero delay, and constant quantization to facilitate still image generation.
-/// Mapping of input YuvData planes to hardware-compatible buffers with support for 8-bit and 10-bit depths in 4:2:0 and 4:4:4 formats.
-/// Execution of the encoding pipeline and extraction of the resulting bitstream through immediate encoder flushing.
-fn encode_av1_frame_gpu(
+/// Full open-configuration identity of an NVENC encoder context. constqp and
+/// preset are baked into the session at open time, so a cached context may
+/// only be reused when every open option matches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GpuKey {
+    width: usize,
+    height: usize,
+    format: Pixel,
+    preset: i32,
+    cq: i32,
+}
+
+/// Session-reuse cache for NVENC encoder contexts (OPTIMIZATION_PROPOSALS Q).
+///
+/// Measured 2026-09-06 (RTX 4070): one av1_nvenc context open costs ~80 ms —
+/// ~75% of per-image wall time at 512x512, and 3 opens (~240 ms) per auto_cq
+/// image (two 512x512 trial opens + one full-res open). A cached context
+/// HOLDS its NVENC session open, and the driver caps consumer GPUs at ~8
+/// concurrent sessions shared by ALL pool workers, so capacity must satisfy
+/// `workers * capacity <= 8`. The default of 1 keeps a process's peak
+/// session count at 1 — never worse than the historical open/close-per-image
+/// behavior; compress_dir.py raises it to max(1, NVENC_SESSION_LIMIT //
+/// workers). 0 disables reuse (legacy behavior).
+static GPU_ENCODER_CACHE: std::sync::Mutex<Vec<(GpuKey, ffmpeg::codec::encoder::video::Encoder)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn gpu_ctx_cache_capacity() -> usize {
+    std::env::var("NVAVIF_CTX_CACHE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1)
+}
+
+fn gpu_encoder_cache(
+) -> std::sync::MutexGuard<'static, Vec<(GpuKey, ffmpeg::codec::encoder::video::Encoder)>> {
+    GPU_ENCODER_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Finds and opens a fresh av1_nvenc encoder context (intra-only, zero delay,
+/// constqp). The slow path of encode_av1_frame_gpu: ~80 ms measured for the
+/// NVENC session creation plus FFmpeg codec open.
+fn open_gpu_encoder(
     width: usize,
     height: usize,
     data: &YuvData,
     cq: i32,
     preset: i32,
-) -> PyResult<Vec<u8>> {
+) -> PyResult<ffmpeg::codec::encoder::video::Encoder> {
     let codec = ffmpeg::encoder::find_by_name("av1_nvenc")
         .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("NVIDIA AV1 Encoder not found"))?;
 
@@ -643,10 +691,23 @@ fn encode_av1_frame_gpu(
         options.set("profile", "1");
     }
 
-    let mut encoder = video_ctx.open_as_with(codec, options).map_err(|e| {
+    video_ctx.open_as_with(codec, options).map_err(|e| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("NVENC init failed: {}", e))
-    })?;
+    })
+}
 
+/// Copies one YUV frame into the encoder and collects the completed packet(s)
+/// WITHOUT sending EOF. With delay=0 every intra-only packet is available
+/// immediately, so the context stays usable for the next frame (session
+/// reuse). FFmpeg's nvenc sets repeatSeqHdr=1 for AV1 and gop=0 + forced-idr
+/// makes every frame a keyframe, so each packet is a self-contained AV1
+/// stream, standalone-embeddable as an AVIF item.
+fn stream_gpu_frame(
+    encoder: &mut ffmpeg::codec::encoder::video::Encoder,
+    width: usize,
+    height: usize,
+    data: &YuvData,
+) -> PyResult<Vec<u8>> {
     let mut frame = Video::empty();
     unsafe {
         frame.alloc(data.pixel_format, width as u32, height as u32);
@@ -681,9 +742,6 @@ fn encode_av1_frame_gpu(
     encoder.send_frame(&frame).map_err(|e| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to send frame: {}", e))
     })?;
-    encoder.send_eof().map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to send EOF: {}", e))
-    })?;
 
     let mut packet = Packet::empty();
     let mut out = Vec::new();
@@ -699,6 +757,94 @@ fn encode_av1_frame_gpu(
         ));
     }
 
+    Ok(out)
+}
+
+/// AV1 encoding of a single YUV frame via NVIDIA hardware acceleration (NVENC),
+/// through a process-global session-reuse cache (see GPU_ENCODER_CACHE).
+/// Cache hit: the frame is streamed through the cached context unchanged.
+/// Cache miss: a fresh context is opened (~80 ms) and cached for the next
+/// frame with the same open configuration. A broken cached context is
+/// dropped and the frame retried on a fresh open, so a wedged session can
+/// never wedge a batch.
+fn encode_av1_frame_gpu(
+    width: usize,
+    height: usize,
+    data: &YuvData,
+    cq: i32,
+    preset: i32,
+) -> PyResult<Vec<u8>> {
+    let t_total = std::time::Instant::now();
+    let capacity = gpu_ctx_cache_capacity();
+    let key = GpuKey {
+        width,
+        height,
+        format: data.pixel_format,
+        preset,
+        cq,
+    };
+
+    if capacity > 0 {
+        let mut cache = gpu_encoder_cache();
+        if let Some(pos) = cache.iter().position(|(k, _)| *k == key) {
+            let (k, mut encoder) = cache.swap_remove(pos);
+            match stream_gpu_frame(&mut encoder, width, height, data) {
+                Ok(out) => {
+                    if debug_timing_enabled() {
+                        eprintln!(
+                            "[nvavif_py] timing: nvenc ctx_reuse {}x{} total {:.2} ms",
+                            width,
+                            height,
+                            t_total.elapsed().as_secs_f64() * 1e3
+                        );
+                    }
+                    cache.push((k, encoder));
+                    return Ok(out);
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[nvavif_py] WARN: cached NVENC context failed ({}); reopening fresh.",
+                        err
+                    );
+                }
+            }
+        }
+        // Evict BEFORE opening the fresh context: the new session must never
+        // coexist with the cached one. Open-then-evict briefly held TWO
+        // sessions per worker — 8 workers then exceed the driver's 8-session
+        // cap and double peak NVENC buffer memory, which made the largest
+        // corpus image fail NVENC init and silently fall back to CPU
+        // (1.65 s -> 70 s). With evict-first the per-worker peak is 1 session,
+        // identical to the historical open/close-per-image behavior.
+        while cache.len() >= capacity {
+            cache.remove(0);
+        }
+    }
+
+    let t_open = std::time::Instant::now();
+    let mut encoder = open_gpu_encoder(width, height, data, cq, preset)?;
+    if debug_timing_enabled() {
+        eprintln!(
+            "[nvavif_py] timing: nvenc ctx_open {}x{} {:.2} ms",
+            width,
+            height,
+            t_open.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    let out = stream_gpu_frame(&mut encoder, width, height, data)?;
+
+    if capacity > 0 {
+        gpu_encoder_cache().push((key, encoder));
+    }
+
+    if debug_timing_enabled() {
+        eprintln!(
+            "[nvavif_py] timing: gpu encode {}x{} total {:.2} ms",
+            width,
+            height,
+            t_total.elapsed().as_secs_f64() * 1e3
+        );
+    }
     Ok(out)
 }
 
@@ -1041,6 +1187,7 @@ fn build_yuv<R: PixelReader>(
 /// Automatic selection between hardware-accelerated (NVENC) and software (rav1e) encoders based on hardware availability and device parameters.
 /// Zero-copy transformation of input buffers (u8, u16, f32) into YUV planes using memory casting.
 /// Provision for SSIM-based quality calibration, independent alpha channel compression, and embedding of CICP color metadata and EXIF segments.
+/// Returns a tuple of the AVIF bitstream and the effective color-plane CQ (the calibrated value when auto-CQ is enabled).
 #[pyfunction]
 #[pyo3(signature = (pixels, width, height, input_dtype, cq=20, auto_cq=false, target_ssim=0.985, alpha_cq=None, preset=6, depth=PyColorDepth::TenBit, chroma=PyChroma::YUV444, matrix=PyColorMatrix::Bt709, exif=None, device="auto"))]
 #[allow(clippy::too_many_arguments)]
@@ -1060,7 +1207,7 @@ fn encode_avif(
     matrix: PyColorMatrix,
     exif: Option<&[u8]>,
     device: &str, // "auto", "gpu", "cpu"
-) -> PyResult<Py<PyBytes>> {
+) -> PyResult<(Py<PyBytes>, i32)> {
     ensure_ffmpeg_init();
 
     // Fallback router
@@ -1137,7 +1284,7 @@ fn encode_avif(
     let bit_depth = if depth == PyColorDepth::TenBit { 10 } else { 8 };
 
     // Modify CICP metadata to add BT2020 labeling
-    let avif_bytes = py.detach(move || -> PyResult<Vec<u8>> {
+    let (avif_bytes, final_cq) = py.detach(move || -> PyResult<(Vec<u8>, i32)> {
         // Logs of the fallback router
         if !use_gpu && !WARNED_CPU.swap(true, Ordering::Relaxed) {
             eprintln!("[nvavif_py] INFO: NVENC is missing or disabled. Seamlessly falling back to CPU rav1e software encoder.");
@@ -1321,10 +1468,10 @@ fn encode_avif(
 
         let avif = aviffy.to_vec(&color_av1, alpha_av1.as_deref(), width as u32, height as u32, bit_depth);
 
-        Ok(avif)
+        Ok((avif, final_cq))
     })?;
 
-    Ok(PyBytes::new(py, &avif_bytes).into())
+    Ok((PyBytes::new(py, &avif_bytes).into(), final_cq))
 }
 
 /// Parallel conversion of YUV video frames to RGB or RGBA pixel data.
@@ -1717,5 +1864,120 @@ mod alpha_dbg_tests {
             let mask = std::fs::read(&mask_path).unwrap();
             assert_eq!(plane, mask, "{name}: extracted alpha plane must be byte-exact");
         }
+    }
+}
+
+#[cfg(test)]
+mod ctx_reuse_tests {
+    use super::*;
+
+    fn nv12_content(dim: usize, invert: bool) -> YuvData {
+        let y: Vec<u8> = (0..dim * dim)
+            .map(|i| {
+                let x = (i % dim) as u32;
+                let row = (i / dim) as u32;
+                let v = ((x * 3 / 7 + row * 5 / 11) % 256) as u8;
+                if invert { 255 - v } else { v }
+            })
+            .collect();
+        YuvData {
+            y,
+            u: vec![128; (dim / 2) * (dim / 2) * 2],
+            v: vec![],
+            pixel_format: Pixel::NV12,
+        }
+    }
+
+    /// Standalone dav1d decode of one AV1 packet: every output must decode
+    /// with a FRESH decoder context to prove the packet is self-contained.
+    fn decode_luma(av1: &[u8]) -> Option<(Vec<u8>, usize, usize)> {
+        let decoder_codec = ffmpeg::decoder::find_by_name("libdav1d")?;
+        let mut decoder_ctx = ffmpeg::codec::context::Context::new_with_codec(decoder_codec)
+            .decoder()
+            .video()
+            .ok()?;
+        let mut pkt = Packet::empty();
+        unsafe {
+            ff_sys::av_new_packet(pkt.as_mut_ptr(), av1.len() as i32);
+            std::ptr::copy_nonoverlapping(av1.as_ptr(), (*pkt.as_mut_ptr()).data, av1.len());
+        }
+        decoder_ctx.send_packet(&pkt).ok()?;
+        let mut decoded = Video::empty();
+        let mut luma = None;
+        while decoder_ctx.receive_frame(&mut decoded).is_ok() {
+            let (w, h) = (decoded.width() as usize, decoded.height() as usize);
+            let stride = decoded.stride(0);
+            let data = decoded.data(0);
+            let mut plane = Vec::with_capacity(w * h);
+            for row in 0..h {
+                plane.extend_from_slice(&data[row * stride..row * stride + w]);
+            }
+            luma = Some((plane, w, h));
+        }
+        luma
+    }
+
+    fn mae(a: &[u8], b: &[u8]) -> f64 {
+        assert_eq!(a.len(), b.len(), "decoded planes must have equal size");
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (i32::from(*x) - i32::from(*y)).abs() as f64)
+            .sum::<f64>()
+            / a.len() as f64
+    }
+
+    /// The session-reuse property that the whole cache relies on, tested
+    /// rather than assumed: the second frame of a reused context must (a)
+    /// carry its own AV1 sequence header so it decodes standalone, and (b)
+    /// be identical to what a fresh session produces for the same input —
+    /// constqp intra encoding must not depend on session position.
+    #[test]
+    fn reused_session_output_matches_fresh_session() {
+        ensure_ffmpeg_init();
+        let dim = 256;
+        let a = nv12_content(dim, false);
+        let b = nv12_content(dim, true);
+
+        // Probe: no usable NVENC on this machine -> nothing to test here.
+        if open_gpu_encoder(dim, dim, &a, 20, 6).is_err() {
+            println!("NVENC unavailable, skipping ctx reuse test");
+            return;
+        }
+
+        unsafe {
+            // Cache enabled: encode A (fresh open) then B (cache hit).
+            std::env::set_var("NVAVIF_CTX_CACHE", "4");
+        }
+        let out_a1 = encode_av1_frame_gpu(dim, dim, &a, 20, 6).unwrap();
+        let out_b1 = encode_av1_frame_gpu(dim, dim, &b, 20, 6).unwrap();
+
+        unsafe {
+            // Cache disabled: both frames through legacy fresh sessions.
+            std::env::set_var("NVAVIF_CTX_CACHE", "0");
+        }
+        let out_a2 = encode_av1_frame_gpu(dim, dim, &a, 20, 6).unwrap();
+        let out_b2 = encode_av1_frame_gpu(dim, dim, &b, 20, 6).unwrap();
+
+        // Each packet must decode standalone (fresh decoder per packet).
+        let (da1, w, h) = decode_luma(&out_a1).expect("reused-content A must decode standalone");
+        let (db1, _, _) = decode_luma(&out_b1).expect("reused-session frame B must decode standalone");
+        let (da2, _, _) = decode_luma(&out_a2).expect("fresh A must decode");
+        let (db2, _, _) = decode_luma(&out_b2).expect("fresh B must decode");
+        assert_eq!((w, h), (dim, dim));
+
+        // Sanity: the decode actually reconstructed the gradient content.
+        assert!(
+            mae(&da1, &a.y) < 30.0,
+            "decoded A is not the encoded content (MAE {})",
+            mae(&da1, &a.y)
+        );
+
+        // Session position must not change the encode: 2nd frame of a warm
+        // session == 1st frame of a fresh session (allow sub-LSB noise).
+        let err_a = mae(&da1, &da2);
+        let err_b = mae(&db1, &db2);
+        println!("ctx reuse MAE: A {err_a:.4}, B {err_b:.4}");
+        assert!(err_a < 1.0, "reused-session A differs from fresh A (MAE {err_a})");
+        assert!(err_b < 1.0, "reused-session B differs from fresh B (MAE {err_b})");
     }
 }

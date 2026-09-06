@@ -168,8 +168,9 @@ def encode_file(
         chroma=Chroma.YUV420,
         matrix: ColorMatrix = ColorMatrix.BT709,
         exif: bytes | None = None,
-        device: Device = Device.AUTO
-) -> bytes:
+        device: Device = Device.AUTO,
+        with_cq: bool = False
+) -> bytes | tuple[bytes, int]:
     """
     Encodes image data from various sources into AVIF format
     using hardware acceleration if NVENC available, or multy-threading CPU-encoder.
@@ -204,6 +205,9 @@ def encode_file(
         exif (bytes | None, optional): raw EXIF metadata to embed in the output image.
         device (str, optional): target processing device ("auto", "gpu", "cpu").
             default "auto".
+        with_cq (bool, optional): when True, returns a ``(bytes, cq)`` tuple where
+            ``cq`` is the effective color-plane CQ actually used (the value chosen
+            by auto-CQ calibration when ``auto_cq`` is enabled). default False.
     Note:
         If NVENC is unavailable, the encoder transparently switches to a multithreaded CPU implementation.
 
@@ -222,7 +226,8 @@ def encode_file(
         - 20–30: High efficiency (optimal for web).
 
     Returns:
-        bytes: The encoded AVIF image as a byte string.
+        bytes: The encoded AVIF image as a byte string. When ``with_cq`` is True,
+            a tuple ``(bytes, cq)`` with the effective color-plane CQ instead.
 
     Raises:
         TypeError: If the `input_source` type is not supported.
@@ -323,8 +328,8 @@ def encode_file(
         clamped_q = max(0.0, min(100.0, float(target_quality)))
         target_ssim = 1.0 - 0.5 * ((100.0 - clamped_q) / 100.0) ** 2
 
-    # Call Rust function
-    return encode_avif(
+    # Call Rust function; the binding returns (bitstream, effective color CQ)
+    data, chosen_cq = encode_avif(
         pixels=img_array.tobytes(),
         width=w,
         height=h,
@@ -340,6 +345,9 @@ def encode_file(
         exif=exif,
         device=device
     )
+    if with_cq:
+        return data, chosen_cq
+    return data
 
 
 def decode_file(path: str | Path, threads: int = 0) -> np.ndarray:

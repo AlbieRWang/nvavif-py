@@ -647,3 +647,34 @@ WIC 注意事项：WPF `CopyPixels` 查询对 alpha HEIC 一律返回 `Bgr32` �
 6. 对 YUV444 显式 GPU 增加按运行时 capability 的测试和清晰错误信息。
 
 暂时保留项目目录中的 `msys64`、FFmpeg 源码、dav1d 源码和 `ffmpeg-out`，后续修改 Rust 或重新打包 wheel 时可以直接复用。
+
+## 16. NVENC 上下文 LRU 复用（2026-09-06，方案 Q 落地）
+
+动机与实测见 OPTIMIZATION_PROPOSALS 方案 Q 落地结果。实现要点与踩坑：
+
+- **实测前提**：`encode_av1_frame_gpu` 每次打开 av1_nvenc 上下文实测 ~80 ms（`NVAVIF_DEBUG_TIMING=1` 的 stderr 计时插桩），占 512×512 单图墙钟 ~75%；文档此前"5~20 ms"的估计是错的。
+- **缓存设计**：lib.rs 进程内 `GPU_ENCODER_CACHE`（`Mutex<Vec<(GpuKey, Encoder)>>`，Vec 当 LRU 用）。key = (宽，高，像素格式，preset，cq)——constqp/preset 烧在会话里，任何打开选项不同都不可复用。
+- **正确性依据（测试锁定）**：`gop=0 + forced-idr` 下每帧都是关键帧，FFmpeg nvenc 对 AV1 硬编码 `repeatSeqHdr=1`（nvenc.c:1722），因此复用会话的每个包都是自包含 AV1 流；`src/lib.rs` 的 `ctx_reuse_tests::reused_session_output_matches_fresh_session` 断言复用会话第 2 帧与全新会话输出解码 MAE=0.0 且各自独立可解码。命中路径不 `send_eof`（`delay=0` 时包在 `send_frame` 后立即可收），EOF 语义交给 context 的 Drop。
+- **容量 = 会话预算**：`NVAVIF_CTX_CACHE`（默认 1 = 峰值会话数与旧的开/关行为相同；0 = 禁用复用）。`compress_dir.py` 设 `max(1, NVENC_SESSION_LIMIT // workers)`，`workers × 容量 ≤ 8` 恒成立。
+- **坑 1（先开后驱逐 → 会话数/显存双超）**：miss 路径若先开新上下文再驱逐旧的，每 worker 瞬时持有 2 个会话——8 worker 超 8 会话上限、NVENC 缓冲显存翻倍（峰值 9.1 GB），语料最大图 NVENC 初始化失败**静默回落 CPU**（1.65 s → 70 s，且单图输出变小，容易被误读成"压缩率改善"）。必须**先驱逐再开**，保证任意时刻每 worker ≤1 个会话。
+- **坑 2（拿显存换时间）**：缓存命中间隙常驻上一个上下文，8 worker 常驻缓冲使 VRAM 均值/峰值上移（本机 12 GB 峰值 8.1 GB 无压力）；小显存 GPU 上应下调 worker 数或容量。
+- **收益边界**：只对"同尺寸密集语料"（cq20 25×，107.9 → 4.3 ms/张）与"auto_cq 语料"（试编码上下文固定 512×512，与源尺寸无关，容量 ≥3 时任意语料 3.1×、同尺寸 15.7×）生效；尺寸互异 + 固定 cq 的语料零收益零伤害（全量 79 张语料输出与改前逐字节一致）。
+- 批量侧接入：`compress_dir.py` worker 环境变量 + 报表 `ctx_cache_per_worker` 字段；测量工具 `uvtest/measure_ctx_overhead.py`（单进程合成语料 + stderr 计时聚合）。
+
+## 17. auto_cq 逐图 CQ 分布与 CQ 边界分析（2026-09-06）
+
+逐图标定 CQ 已随报表留档（`encode_avif` 返回 (bytes, final_cq)，`encode_file(with_cq=True)`，报表 AVIF 行 `cq` 字段，PARITY_MATRIX M9）。test_imgs 全量（41 张 AVIF，`--auto-quality 90`，目标 SSIM 0.995）实测分布 `{16:14, 19:1, 20:1, 22:1, 25:1, 26:3, 30:2, 39:1, 40:1, 43:1, 45:2, 50:1, 51:12}`——横跨 16~51 且与内容强相关：**大照片 JPEG 标到 16（safeguard 钉住，SSIM 渐近线），简单图形/waifu2x PNG 标到 51**。按桶的存储对比（AVIF 路由，keep-smaller 口径）：
+
+| 桶 | 张数 | auto q90 | auto q88 | 固定 CQ20 |
+|---|---|---|---|---|
+| CQ16（大照片） | 14 | 65.5 MB | 61.6 MB | 59.3 MB |
+| 中间 19–45 | 14 | 32.8 MB | 28.5 MB | 35.7 MB |
+| CQ50+（简单图形） | 13 | 6.4 MB | 6.4 MB | 11.0 MB |
+| 合计 | 41 | 104.7 MB | 96.5 MB | 106.0 MB |
+
+结论：
+
+- **固定 CQ20 的总量与 auto q90 几乎持平（106.0 vs 104.7 MB）纯属两桶反向抵消**：大照片省 6.2 MB（SSIM 仅降 0.0006~0.0009，实测 8 张 12–24 MP 照片），但中间桶 +2.9 MB、图形桶 +72%（6.4→11.0 MB），且丢失 keep-smaller 对"压不动的小图"的保护（4 张小 JPG 在 CQ20 下以 SSIM 0.983~0.994 被存储，auto 下保留源）。
+- **CQ 边界不需要新增 clamp**：下限已有 safeguard 钉 16（防噪声图冲 CQ0 爆体积），上限 51 只在"连 51 都满足 SSIM 目标"时达到（图形桶仅 6.4 MB，无过度压缩证据），外加 keep-smaller 兜底。存储多少的真正旋钮是 `--auto-quality`：**90→88 实测全面占优**（96.5 MB，比固定 CQ20 还少 9.5 MB，同时保留逐图自适应，照片 16–18、图形仍 51）。
+- 大图不必单独固定 CQ20；若语料几乎全是照片且接受轻微质量损失，固定 20 可再省 ~9.5%。
+- **已采纳**：`compress_config.json` 的 `auto_quality` 设为 88（混合图库的标准配置）。

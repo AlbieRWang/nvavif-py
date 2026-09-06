@@ -9,16 +9,22 @@ Images are encoded by a process pool: each worker gets its own NVENC
 session, so GPU color encodes of different images overlap, and CPU alpha
 encodes overlap with GPU color encodes of other images. The worker count
 is capped by the driver's concurrent-NVENC-session limit (~8 on RTX 40
-series); oversized (>8192) images never take the GPU anyway. Jobs are
-submitted slowest-first (header-probe cost estimate), and each worker's
-rav1e contexts are thread-capped so parallel CPU encodes do not thrash
-(alpha: cores/workers, oversize color fallback: cores/oversize-jobs).
+series); oversized (>8192) images never take the GPU anyway. Each worker
+keeps its NVENC encoder contexts open across images (LRU sized so that
+workers x capacity stays within the driver session budget), which removes
+the ~80 ms context-open cost per encode (measured 2026-09-06; ~75% of
+per-image wall time at 512x512). Jobs are submitted slowest-first
+(header-probe cost estimate), and each worker's rav1e contexts are
+thread-capped so parallel CPU encodes do not thrash (alpha: cores/workers,
+oversize color fallback: cores/oversize-jobs).
 
 Usage (from the repo root, single root .venv):
     uv run python uvtest/compress_dir.py                       # test_imgs -> out/compressed
     uv run python uvtest/compress_dir.py --cq 26               # web-quality preset
     uv run python uvtest/compress_dir.py --src DIR --dst DIR   # custom folders
-    uv run python uvtest/compress_dir.py --auto-quality 80     # SSIM-targeted quality
+    uv run python uvtest/compress_dir.py --auto-quality 88     # SSIM-targeted quality
+                                                               # (88 = measured storage/quality sweet spot on
+                                                               # mixed galleries; the default in compress_config.json)
     uv run python uvtest/compress_dir.py --workers 4           # cap parallelism
     uv run python uvtest/compress_dir.py --transparent-format webp   # transparent -> WebP (default)
     uv run python uvtest/compress_dir.py --copy-skipped        # mirror kept/skipped/failed sources (default on)
@@ -48,6 +54,12 @@ Routing rules (all tunable):
 Unchanged sources (kept by --keep-smaller, pre-filtered JPEGs, failures) are
 copied into the output folder by default (--copy-skipped) so the output count
 matches the input; --in-place replaces sources in their own folder instead.
+
+Metadata: EXIF orientation is physically applied to the pixels, and the
+remaining EXIF plus the ICC profile are embedded in WebP/PNG outputs
+(wide-gamut sources keep their profile). The AVIF route instead converts
+non-sRGB pixels to sRGB (avif-serialize cannot embed a profile) and does not
+pass raw EXIF bytes.
 
 The scan is recursive by default and the output mirrors the source's relative
 folder structure. GIF and animated WebP sources are skipped untouched (a
@@ -84,7 +96,7 @@ for _dll_dir in (
 # would shadow the nvavif_py wheel installed in the root .venv.
 
 import nvavif_py as nv  # noqa: E402
-from PIL import Image  # noqa: E402
+from PIL import Image, ImageOps  # noqa: E402
 
 # Sources beyond Pillow's default ~89 MP "decompression bomb" guard are
 # legitimate inputs here (oversized photography; --oversize-max-edge even
@@ -274,54 +286,84 @@ def _encode_task(task: dict) -> dict:
         method = task["webp_method"] if (transparent_route or not oversize) else task["oversize_webp_method"]
         out_path = Path(task["out_path"]).with_suffix(f".{whole_format}")
         with Image.open(path) as im:
+            src_exif = im.info.get("exif")
+            src_icc = im.info.get("icc_profile")
             rgba = im.convert("RGBA")
+        if src_exif:
+            # Match the AVIF route (encode_file wrapper): physically apply the
+            # EXIF orientation so the output shows what every viewer showed
+            # for the source; the returned image's EXIF has the orientation
+            # tag removed, so viewers won't rotate the correct pixels again.
+            rgba = ImageOps.exif_transpose(rgba)
+            src_exif = rgba.info.get("exif")
+            if rgba.size != (orig_width, orig_height):
+                # Transposed (90° orientation): header dims no longer describe
+                # the pixels — swap them and recompute the resize target.
+                orig_width, orig_height = rgba.size
+                width, height = orig_width, orig_height
+                if need_resize:
+                    scale = resize_limit / max(orig_width, orig_height)
+                    width = max(1, int(orig_width * scale))
+                    height = max(1, int(orig_height * scale))
             if need_resize:
                 rgba = rgba.resize((width, height), Image.LANCZOS)
-            if in_place:
-                # Write-then-replace via a temp file: a .png/.webp source can
-                # share its name with the output, and a failed encode must
-                # never take the original down with it.
-                tmp_path = out_path.with_name(out_path.stem + ".tmp" + out_path.suffix)
-                if whole_format == "webp":
-                    rgba.save(tmp_path, "WEBP", quality=quality, lossless=lossless, method=method)
-                else:
-                    rgba.save(tmp_path, "PNG")
-                out_bytes = tmp_path.stat().st_size
-                if task["keep_smaller"] and out_bytes >= src_bytes:
-                    tmp_path.unlink()
-                    return {
-                        "ok": True,
-                        "row": {
-                            "name": display_name,
-                            "action": "kept_source",
-                            "format": whole_format,
-                            "src_bytes": src_bytes,
-                            "avif_bytes": out_bytes,
-                            "encode_s": round(time.perf_counter() - t0, 3),
-                        },
-                    }
-                os.replace(tmp_path, out_path)
-                if path.resolve() != out_path.resolve():
-                    path.unlink()
+        elif need_resize:
+            rgba = rgba.resize((width, height), Image.LANCZOS)
+        # WebP/PNG containers carry ICC and EXIF natively, so embed both
+        # as-is — wide-gamut sources keep their profile instead of being
+        # silently reinterpreted as sRGB. (The AVIF route converts pixels to
+        # sRGB instead because avif-serialize cannot embed a profile, and
+        # does not pass raw EXIF bytes today.)
+        save_meta = {}
+        if src_exif:
+            save_meta["exif"] = src_exif
+        if src_icc:
+            save_meta["icc_profile"] = src_icc
+        if in_place:
+            # Write-then-replace via a temp file: a .png/.webp source can
+            # share its name with the output, and a failed encode must
+            # never take the original down with it.
+            tmp_path = out_path.with_name(out_path.stem + ".tmp" + out_path.suffix)
+            if whole_format == "webp":
+                rgba.save(tmp_path, "WEBP", quality=quality, lossless=lossless, method=method, **save_meta)
             else:
-                if whole_format == "webp":
-                    rgba.save(out_path, "WEBP", quality=quality, lossless=lossless, method=method)
-                else:
-                    rgba.save(out_path, "PNG")
-                out_bytes = out_path.stat().st_size
-                if task["keep_smaller"] and out_bytes >= src_bytes:
-                    out_path.unlink()
-                    return {
-                        "ok": True,
-                        "row": {
-                            "name": display_name,
-                            "action": "kept_source",
-                            "format": whole_format,
-                            "src_bytes": src_bytes,
-                            "avif_bytes": out_bytes,
-                            "encode_s": round(time.perf_counter() - t0, 3),
-                        },
-                    }
+                rgba.save(tmp_path, "PNG", **save_meta)
+            out_bytes = tmp_path.stat().st_size
+            if task["keep_smaller"] and out_bytes >= src_bytes:
+                tmp_path.unlink()
+                return {
+                    "ok": True,
+                    "row": {
+                        "name": display_name,
+                        "action": "kept_source",
+                        "format": whole_format,
+                        "src_bytes": src_bytes,
+                        "avif_bytes": out_bytes,
+                        "encode_s": round(time.perf_counter() - t0, 3),
+                    },
+                }
+            os.replace(tmp_path, out_path)
+            if path.resolve() != out_path.resolve():
+                path.unlink()
+        else:
+            if whole_format == "webp":
+                rgba.save(out_path, "WEBP", quality=quality, lossless=lossless, method=method, **save_meta)
+            else:
+                rgba.save(out_path, "PNG", **save_meta)
+            out_bytes = out_path.stat().st_size
+            if task["keep_smaller"] and out_bytes >= src_bytes:
+                out_path.unlink()
+                return {
+                    "ok": True,
+                    "row": {
+                        "name": display_name,
+                        "action": "kept_source",
+                        "format": whole_format,
+                        "src_bytes": src_bytes,
+                        "avif_bytes": out_bytes,
+                        "encode_s": round(time.perf_counter() - t0, 3),
+                    },
+                }
         elapsed = time.perf_counter() - t0
         return {
             "ok": True,
@@ -350,7 +392,7 @@ def _encode_task(task: dict) -> dict:
         kwargs.update(auto_cq=True, target_quality=task["auto_quality"])
     else:
         kwargs["cq"] = task["cq"]
-    data = nv.encode_file(path, **kwargs)
+    data, chosen_cq = nv.encode_file(path, with_cq=True, **kwargs)
     elapsed = time.perf_counter() - t0
 
     # Guard: never store something bigger than the source. The source stays
@@ -361,14 +403,15 @@ def _encode_task(task: dict) -> dict:
             shutil.copy2(path, out_path.parent / path.name)
         return {
             "ok": True,
-            "row": {
-                "name": display_name,
-                "action": "kept_source",
-                "format": "avif",
-                "src_bytes": src_bytes,
-                "avif_bytes": len(data),
-                "encode_s": round(elapsed, 3),
-            },
+                "row": {
+                    "name": display_name,
+                    "action": "kept_source",
+                    "format": "avif",
+                    "cq": chosen_cq,
+                    "src_bytes": src_bytes,
+                    "avif_bytes": len(data),
+                    "encode_s": round(elapsed, 3),
+                },
         }
     out_path.write_bytes(data)
 
@@ -382,6 +425,7 @@ def _encode_task(task: dict) -> dict:
             "name": display_name,
             "action": "encoded",
             "format": "avif",
+            "cq": chosen_cq,
             "mode": mode,
             "alpha": "A" in mode.upper() or mode == "PA",
             "width": width,
@@ -756,6 +800,13 @@ def main() -> None:
     if args.color_rav1e_threads > 0:
         os.environ["NVAVIF_RAV1E_THREADS_COLOR"] = str(args.color_rav1e_threads)
 
+    # Session-reuse budget (OPTIMIZATION_PROPOSALS Q): each worker's NVENC
+    # context cache HOLDS its sessions open, so workers * capacity must stay
+    # within the driver's concurrent-session cap. workers=8 -> 1 (never worse
+    # than the old open/close-per-image), workers=4 -> 2, 1 worker -> 8.
+    ctx_cache = max(1, NVENC_SESSION_LIMIT // workers)
+    os.environ["NVAVIF_CTX_CACHE"] = str(ctx_cache)
+
     total_in = total_out = 0
     total_px = 0
     kept_src_bytes = 0
@@ -799,9 +850,15 @@ def main() -> None:
                     failures.append(f"{task.get('name', task['path'])}: {exc}")
                     print(f"{tag} FAIL {task.get('name', task['path'])}: {exc}")
                     if args.copy_skipped and not args.in_place:
-                        try:  # failed source is copied too, so the output
-                            # folder still mirrors the input count
-                            shutil.copy2(task["path"], args.dst / Path(task["path"]).name)
+                        try:
+                            # failed source is copied too, so the output folder
+                            # still mirrors the input count — into the source's
+                            # mirrored subfolder (out_path's parent), not the
+                            # output root, which would flatten recursive runs
+                            # and collide same-named sources
+                            fail_dir = Path(task["out_path"]).parent
+                            fail_dir.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(task["path"], fail_dir / Path(task["path"]).name)
                         except Exception:
                             pass
 
@@ -871,6 +928,7 @@ def main() -> None:
             "oversize_max_edge": args.oversize_max_edge,
             "alpha_rav1e_threads": alpha_threads,
             "color_rav1e_threads": args.color_rav1e_threads,
+            "ctx_cache_per_worker": ctx_cache,
             "summary": {
                 "total": len(files),
                 "encoded": len(enc_rows),
