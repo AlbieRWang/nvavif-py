@@ -27,6 +27,14 @@ jobs:
           
       - name: Build wheels
         uses: PyO3/maturin-action@v1
+        env:
+          # FFmpeg/dav1d land in /usr (before-script-linux) and the yum clang
+          # package puts libclang.so in /usr/lib64. Pin both explicitly so
+          # ffmpeg-sys-next/bindgen never pick up host-machine leftovers — a
+          # previously committed .cargo/config.toml leaked a Windows path here
+          # and broke this job (run 34037306768).
+          FFMPEG_DIR: /usr
+          LIBCLANG_PATH: /usr/lib64
         with:
           target: ${{ matrix.target }}
           args: --release --out dist --find-interpreter
@@ -167,6 +175,10 @@ jobs:
         uses: PyO3/maturin-action@v1
         env:
           FFMPEG_DIR: ${{ github.workspace }}/ffmpeg-out
+          # bindgen needs libclang.dll; the hosted runner image ships LLVM at
+          # this path (the local .cargo/config.toml points into msys64, which
+          # does not exist on CI)
+          LIBCLANG_PATH: C:\Program Files\LLVM\bin
         with:
           target: ${{ matrix.target }}
           args: --release --out dist --find-interpreter

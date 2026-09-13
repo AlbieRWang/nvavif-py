@@ -1,0 +1,11 @@
+# Copy to .cargo/config.toml and fix the paths for your machine (these are
+# the values build.bat exports; see DEVELOPMENT_NOTES 5.1 for migration).
+# This file is deliberately NOT tracked by git — CI sets its own env.
+[env]
+FFMPEG_DIR = 'C:\path\to\nvavif-py\ffmpeg-out'
+FFMPEG_INCLUDE_DIR = 'C:\path\to\nvavif-py\ffmpeg-out\include'
+FFMPEG_LIB_DIR = 'C:\path\to\nvavif-py\ffmpeg-out\lib'
+PKG_CONFIG_PATH = 'C:\path\to\nvavif-py\ffmpeg-out\lib\pkgconfig'
+PKG_CONFIG = 'C:\path\to\nvavif-py\msys64\mingw64\bin\pkg-config.exe'
+LIBCLANG_PATH = 'C:\path\to\nvavif-py\msys64\mingw64\bin'
+NASM = 'C:\path\to\nvavif-py\msys64\mingw64\bin\nasm.exe'

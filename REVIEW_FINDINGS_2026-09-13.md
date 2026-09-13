@@ -64,9 +64,19 @@
   limited-range AVIF 解码,触发条件已写明)、A10(保持文档化,不加 API 表面)。
 - 全部 ⏸ 清零。
 
+**CI 实跑结果(同日 push 后;此前该工作流仅 09-06 跑过一次且失败,从未绿过):**
+- Linux job 失败根因:**被提交的 `.cargo/config.toml`** 用 `[env]` 把本机 Windows 路径
+  (`FFMPEG_DIR='O:\Project\...'`)带进了 manylinux docker,ffmpeg-sys-next 按它找头文件
+  必然失败(日志:`cargo:rustc-link-search=native=O:\Project\...`);
+- Windows job 失败根因:bindgen 找不到 `libclang.dll`(本地靠 config.toml 的
+  `LIBCLANG_PATH` 指向 msys64,CI 上不存在)。
+- **修复(第三轮追加)**:`.cargo/config.toml` 移出 git 跟踪(本机保留,新增
+  `.cargo/config.toml.example` 模板 + .gitignore 条目,DEVELOPMENT_NOTES 5.1/17 同步);
+  CI 两个 job 显式注入 `FFMPEG_DIR`/`LIBCLANG_PATH`(Linux=/usr 与 /usr/lib64,
+  Windows=workspace/ffmpeg-out 与 runner 自带的 `C:\Program Files\LLVMin`)。
+
 **遗留注意事项:**
-- CI 的 auditwheel/smoke 步骤是 YAML 静态校验过的,尚未在真 CI 跑过——下次 push 时观察;
-- 改动尚未 commit。
+- CI 修复后的运行仍在观察中(运行记录见 GitHub Actions)。
 
 ---
 

@@ -125,7 +125,7 @@ uv run python setup_env.py
 - `python-source = "source"`：Python 包挪到 `source\nvavif_py\`，仓库根目录不再存在叫 `nvavif_py` 的目录——只要根目录进了 `sys.path`（`python -c`、pytest、IDE）就遮蔽 wheel 的问题从根上消除（§9 两次踩坑的根治）。
 - 构建流程：`build.bat`（maturin build → `dist-local\`）→ `setup_env.py` 自动 delvewheel 修复 → venv。venv 里只应存在 `dist\repaired-current\` 的修复版 wheel。
 
-**新机器迁移（干净 clone）**：git 不携带任何构建产物——`dist-local\`、`dist\`、`target\` 均被忽略，目标机必须本地执行一次 `build.bat --out dist-local`（冷编译几分钟）再 `uv run python setup_env.py`，打印 `ENV OK` 即就绪。工具链依赖仓库内自带的 `msys64\` 与 `ffmpeg-out\`（迁移时直接整目录拷贝项目文件夹）；FFmpeg/pkg-config/LIBCLANG/NASM 变量已固化在 `.cargo/config.toml` 的 `[env]`，`build.bat` 自带 PATH/LIBCLANG_PATH，运行时 DLL 由 delvewheel 打进 wheel——新机器无需手工配任何环境变量。
+**新机器迁移（干净 clone）**：git 不携带任何构建产物——`dist-local\`、`dist\`、`target\` 均被忽略，目标机必须本地执行一次 `build.bat --out dist-local`（冷编译几分钟）再 `uv run python setup_env.py`，打印 `ENV OK` 即就绪。工具链依赖仓库内自带的 `msys64\` 与 `ffmpeg-out\`（迁移时直接整目录拷贝项目文件夹）；FFmpeg/pkg-config/LIBCLANG/NASM 变量由 `build.bat` 导出（自带 PATH/LIBCLANG_PATH）；`.cargo/config.toml` 自 2026-09-13 起**不入库**（曾在 CI 把本机路径泄漏进 Linux 构建导致失败）——`uv run` 直接构建需先从 `.cargo/config.toml.example` 复制并改成本机路径，只跑 `build.bat` 则无需该文件，运行时 DLL 由 delvewheel 打进 wheel——新机器无需手工配任何环境变量。
 
 ## 6. 从 PyPI 验证安装
 
@@ -390,7 +390,7 @@ uv run python uvtest\compress_dir.py --report none
 
 每次运行默认在输出目录生成 `compress_report.json`：逐图（尺寸/模式/是否alpha/源大小/输出大小/压缩率/bpp/耗时/MP/s）+ 全程资源采样（CPU%/内存，含全部子进程；GPU%/NVENC 编码器占用%/显存）。后续性能优化以此为基线。
 
-环境说明（2026-09-05 更新）：`uv run` 已可**不带 `--no-sync`** 直接使用——构建所需的 FFmpeg/pkg-config/LIBCLANG/NASM 变量固化在 `.cargo/config.toml` 的 `[env]`，`msys64\mingw64\bin` 已追加进用户 PATH（bindgen 的 `libclang.dll` 依赖同目录的 `libLLVM-22.dll`，普通 shell 没有该目录时加载失败，这是此前 `--no-sync` 约定的原因）。注意两点：uv 触发的是源码 editable 构建，修改 `src/*.rs` 后下次 `uv run` 会自动增量重编译；裸 `python -c` 导入仍需先注册 `ffmpeg-out\bin` DLL 目录（uvtest 脚本均已内置），用 `build.bat` 构建发布 wheel 的流程不变。
+环境说明（2026-09-05 更新）：`uv run` 已可**不带 `--no-sync`** 直接使用——构建所需的 FFmpeg/pkg-config/LIBCLANG/NASM 变量固化在 `.cargo/config.toml` 的 `[env]`（**本机文件，git 不携带**，干净 clone 后从 `config.toml.example` 复制），`msys64\mingw64\bin` 已追加进用户 PATH（bindgen 的 `libclang.dll` 依赖同目录的 `libLLVM-22.dll`，普通 shell 没有该目录时加载失败，这是此前 `--no-sync` 约定的原因）。注意两点：uv 触发的是源码 editable 构建，修改 `src/*.rs` 后下次 `uv run` 会自动增量重编译；裸 `python -c` 导入仍需先注册 `ffmpeg-out\bin` DLL 目录（uvtest 脚本均已内置），用 `build.bat` 构建发布 wheel 的流程不变。
 
 ### 10.3 导出可查看的完整测试集
 

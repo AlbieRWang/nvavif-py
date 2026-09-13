@@ -103,3 +103,6 @@ test_imgs/
 
 # Local wheel build output
 dist-local/
+
+# Machine-local build env (FFMPEG_DIR/LIBCLANG_PATH/... see config.toml.example)
+.cargo/config.toml
