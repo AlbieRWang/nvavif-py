@@ -14,5 +14,3 @@ avif-serialize = "0.8.8"
 rayon = "1.11.0"
 bytemuck = { version = "1", features = ["derive"] }
 rav1e = { version = "0.7.1", default-features = false, features = ["threading"] }
-rgb = "0.8.52"
-imgref = "1.12.0"

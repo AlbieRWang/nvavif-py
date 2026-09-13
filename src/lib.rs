@@ -18,6 +18,21 @@ static FFMPEG_INIT: Once = Once::new();
 // -1 (unchecked), 0 (no), 1 (yes)
 static HW_SUPPORT: AtomicI8 = AtomicI8::new(-1);
 static WARNED_CPU: AtomicBool = AtomicBool::new(false);
+static WARNED_GPU_FALLBACK: AtomicBool = AtomicBool::new(false);
+
+/// Prints a GPU→CPU fallback warning once per process. A per-image WARN is
+/// correct for interactive use but spams the batch log when every image hits
+/// the same transient failure (e.g. driver reset), so later occurrences are
+/// silent; the batch tool's per-image `mp_per_s` report rows remain the
+/// per-image detector for slow CPU fallbacks.
+fn warn_gpu_fallback_once(context: &str, err: &dyn std::fmt::Display) {
+    if !WARNED_GPU_FALLBACK.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "[nvavif_py] WARN: NVENC failed ({}: {}); falling back to CPU. Further NVENC fallbacks are silent.",
+            context, err
+        );
+    }
+}
 
 fn ensure_ffmpeg_init() {
     FFMPEG_INIT.call_once(|| {
@@ -159,19 +174,28 @@ impl PixelReader for ReaderU16<'_> {
 struct ReaderF32<'a> {
     data: &'a [f32],
     channels: usize,
+    /// ACES tone mapping only engages when the source actually exceeds the
+    /// SDR range (max > 1.0, decided by the Python wrapper). LDR float input
+    /// — the common `img / 255.0` case — used to be brightened ~6% in the
+    /// midtones by the unconditional ACES curve (REVIEW_FINDINGS A4).
+    tone_map: bool,
 }
 impl PixelReader for ReaderF32<'_> {
     #[inline(always)]
     fn read(&self, idx: usize) -> (f32, f32, f32, f32) {
-        // Cinematic Tonemapper ACES Filmic (Academy of Motion Picture Arts)
-        // Perfectly compresses >1.0 super-bright HDR into SDR bounds without loss of detail
-        let map_aces = |x: f32| -> f32 {
-            let x = x.max(0.0);
-            ((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14)).clamp(0.0, 1.0)
+        let map = |x: f32| -> f32 {
+            if self.tone_map {
+                // Cinematic Tonemapper ACES Filmic (Academy of Motion Picture Arts)
+                // Perfectly compresses >1.0 super-bright HDR into SDR bounds without loss of detail
+                let x = x.max(0.0);
+                ((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14)).clamp(0.0, 1.0)
+            } else {
+                x.clamp(0.0, 1.0)
+            }
         };
-        let r = map_aces(self.data[idx]);
-        let g = map_aces(self.data[idx + 1]);
-        let b = map_aces(self.data[idx + 2]);
+        let r = map(self.data[idx]);
+        let g = map(self.data[idx + 1]);
+        let b = map(self.data[idx + 2]);
         let a = if self.channels == 4 {
             self.data[idx + 3].clamp(0.0, 1.0)
         } else {
@@ -250,8 +274,18 @@ fn extract_yuv420<R: PixelReader>(
                     .enumerate()
                     .for_each(|(y_sub, row_uv)| {
                         for x_sub in 0..(width / 2) {
+                            // 2x2 box average before the matrix multiply;
+                            // top-left single-pixel sampling aliases hard on
+                            // saturated color edges (REVIEW_FINDINGS B3).
                             let idx = (y_sub * 2 * width + x_sub * 2) * channels;
-                            let (r, g, b, _a) = reader.read(idx);
+                            let idx_below = idx + width * channels;
+                            let (r0, g0, b0, _) = reader.read(idx);
+                            let (r1, g1, b1, _) = reader.read(idx + channels);
+                            let (r2, g2, b2, _) = reader.read(idx_below);
+                            let (r3, g3, b3, _) = reader.read(idx_below + channels);
+                            let r = (r0 + r1 + r2 + r3) * 0.25;
+                            let g = (g0 + g1 + g2 + g3) * 0.25;
+                            let b = (b0 + b1 + b2 + b3) * 0.25;
                             row_uv[x_sub * 2] =
                                 ((coefs.ur * r + coefs.ug * g + coefs.ub * b) * 255.0 + 128.0)
                                     .clamp(0.0, 255.0) as u8;
@@ -295,8 +329,16 @@ fn extract_yuv420<R: PixelReader>(
                     .enumerate()
                     .for_each(|(y_sub, row_uv)| {
                         for x_sub in 0..(width / 2) {
+                            // Same 2x2 box average as the 8-bit path (B3).
                             let idx = (y_sub * 2 * width + x_sub * 2) * channels;
-                            let (r, g, b, _a) = reader.read(idx);
+                            let idx_below = idx + width * channels;
+                            let (r0, g0, b0, _) = reader.read(idx);
+                            let (r1, g1, b1, _) = reader.read(idx + channels);
+                            let (r2, g2, b2, _) = reader.read(idx_below);
+                            let (r3, g3, b3, _) = reader.read(idx_below + channels);
+                            let r = (r0 + r1 + r2 + r3) * 0.25;
+                            let g = (g0 + g1 + g2 + g3) * 0.25;
+                            let b = (b0 + b1 + b2 + b3) * 0.25;
                             let u_val =
                                 (coefs.ur * r + coefs.ug * g + coefs.ub * b) * 1023.0 + 512.0;
                             let v_val =
@@ -679,7 +721,11 @@ fn open_gpu_encoder(
     let mut options = Dictionary::new();
     options.set("preset", &format!("p{}", preset));
     options.set("rc", "constqp");
-    options.set("qp", &cq.to_string());
+    // NVENC rejects qp=0 with "Lossless Coding mode not supported" on
+    // consumer Ada GPUs (measured RTX 4070), which silently dropped cq=0
+    // encodes onto the CPU path. qp=1 is the nearest-to-lossless constqp
+    // that stays on hardware (REVIEW_FINDINGS A2).
+    options.set("qp", &cq.max(1).to_string());
     options.set("tune", "hq");
     options.set("bf", "0");
     options.set("delay", "0");
@@ -969,13 +1015,19 @@ fn prepare_trial_frame_8bit(
     let mut selected = Vec::new();
 
     if width >= patch_size && height >= patch_size {
-        let mut variances = Vec::new();
-        for y in (0..height.saturating_sub(patch_size)).step_by(patch_size / 2) {
-            for x in (0..width.saturating_sub(patch_size)).step_by(patch_size / 2) {
-                let var = block_variance(&y8, width, x, y, patch_size);
-                variances.push((var, x, y));
-            }
-        }
+        // Rayon over patch rows: block_variance is 4M+ byte reads per 4K row
+        // strip, so the sequential scan was the auto_cq bottleneck on large
+        // images (REVIEW_FINDINGS B4).
+        let mut variances: Vec<(f32, usize, usize)> = (0..height.saturating_sub(patch_size))
+            .into_par_iter()
+            .step_by(patch_size / 2)
+            .flat_map_iter(|y| {
+                let y8 = &y8;
+                (0..width.saturating_sub(patch_size))
+                    .step_by(patch_size / 2)
+                    .map(move |x| (block_variance(y8, width, x, y, patch_size), x, y))
+            })
+            .collect();
         variances.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         // central part
         selected.push((width / 2 - patch_size / 2, height / 2 - patch_size / 2));
@@ -1111,18 +1163,25 @@ fn estimate_cq(
     };
     let ssim2 = check_cq_ssim(cq2, &trial_y, trial_dim, preset, use_gpu)?;
 
-    eprintln!(
-        "[nvavif_py] Estimate Pass 1 (CQ {}): SSIM {:.4}",
-        cq1, ssim1
-    );
-    eprintln!(
-        "[nvavif_py] Estimate Pass 2 (CQ {}): SSIM {:.4}",
-        cq2, ssim2
-    );
+    // Diagnostics are opt-in (NVAVIF_DEBUG_TIMING=1): auto_cq runs on every
+    // batch image, and five unconditional stderr lines per image both slow
+    // multi-hour runs and drown the log (REVIEW_FINDINGS B2).
+    if debug_timing_enabled() {
+        eprintln!(
+            "[nvavif_py] Estimate Pass 1 (CQ {}): SSIM {:.4}",
+            cq1, ssim1
+        );
+        eprintln!(
+            "[nvavif_py] Estimate Pass 2 (CQ {}): SSIM {:.4}",
+            cq2, ssim2
+        );
+    }
 
     let diff = ssim2 - ssim1;
     if diff.abs() < 0.0001 {
-        eprintln!("[nvavif_py] Curve is dead flat. Safe-fallback to Anchor (CQ 28)");
+        if debug_timing_enabled() {
+            eprintln!("[nvavif_py] Curve is dead flat. Safe-fallback to Anchor (CQ 28)");
+        }
         return Ok(28);
     }
 
@@ -1135,18 +1194,22 @@ fn estimate_cq(
     if target_ssim > ssim1 && cq2 < cq1 {
         let ssim_gain = ssim2 - ssim1;
         if ssim_gain < 0.015 {
-            eprintln!(
-                "[nvavif_py] SAFEGUARD TRIGGERED: Source contains heavy noise/artifacts. Capping max bitrate."
-            );
+            if debug_timing_enabled() {
+                eprintln!(
+                    "[nvavif_py] SAFEGUARD TRIGGERED: Source contains heavy noise/artifacts. Capping max bitrate."
+                );
+            }
             target_cq = target_cq.max(16.0); // Do not let the codec drop to CQ=0 and create a 15 MB file
         }
     }
 
     let final_cq = target_cq.round().clamp(0.0, 51.0) as i32;
-    eprintln!(
-        "[nvavif_py] Math Target: {:.2} -> Choosed Clamped CQ: {}",
-        target_cq, final_cq
-    );
+    if debug_timing_enabled() {
+        eprintln!(
+            "[nvavif_py] Math Target: {:.2} -> Choosed Clamped CQ: {}",
+            target_cq, final_cq
+        );
+    }
 
     Ok(final_cq)
 }
@@ -1189,7 +1252,7 @@ fn build_yuv<R: PixelReader>(
 /// Provision for SSIM-based quality calibration, independent alpha channel compression, and embedding of CICP color metadata and EXIF segments.
 /// Returns a tuple of the AVIF bitstream and the effective color-plane CQ (the calibrated value when auto-CQ is enabled).
 #[pyfunction]
-#[pyo3(signature = (pixels, width, height, input_dtype, cq=20, auto_cq=false, target_ssim=0.985, alpha_cq=None, preset=6, depth=PyColorDepth::TenBit, chroma=PyChroma::YUV444, matrix=PyColorMatrix::Bt709, exif=None, device="auto"))]
+#[pyo3(signature = (pixels, width, height, input_dtype, cq=20, auto_cq=false, target_ssim=0.985, alpha_cq=None, preset=7, depth=PyColorDepth::EightBit, chroma=PyChroma::YUV420, matrix=PyColorMatrix::Bt709, exif=None, device="auto", tone_map=true))]
 #[allow(clippy::too_many_arguments)]
 fn encode_avif(
     py: Python<'_>,
@@ -1207,8 +1270,48 @@ fn encode_avif(
     matrix: PyColorMatrix,
     exif: Option<&[u8]>,
     device: &str, // "auto", "gpu", "cpu"
+    tone_map: bool,
 ) -> PyResult<(Py<PyBytes>, i32)> {
     ensure_ffmpeg_init();
+
+    // Input validation: previously a (H, W, 1) grayscale array reached the
+    // reader and panicked with a raw index-out-of-bounds instead of a Python
+    // ValueError, and mismatched buffer lengths silently floored `channels`
+    // into a wrong image (REVIEW_FINDINGS A1/A9).
+    if width == 0 || height == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "width and height must be non-zero",
+        ));
+    }
+    let px_count = width * height;
+    let type_size = match input_dtype {
+        "u8" => 1usize,
+        "u16" => 2,
+        "f32" => 4,
+        _ => {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "Unknown input_dtype",
+            ));
+        }
+    };
+    let channels = pixels.len() / px_count / type_size;
+    if channels != 3 && channels != 4 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "unsupported channel count {channels} (pixel buffer must be RGB (3) or RGBA (4))"
+        )));
+    }
+    let expected_len = px_count
+        .checked_mul(channels)
+        .and_then(|v| v.checked_mul(type_size));
+    match expected_len {
+        Some(len) if len == pixels.len() => {}
+        _ => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "pixels length {} does not match width {width} x height {height} x {channels} channels x {input_dtype}",
+                pixels.len()
+            )));
+        }
+    };
 
     // Fallback router
     let has_gpu = is_hardware_supported();
@@ -1225,18 +1328,6 @@ fn encode_avif(
         _ => has_gpu, // auto fallback
     };
 
-    // Calculate the number of channels based on the type and size of the raw array:
-    let px_count = width * height;
-    let channels = match input_dtype {
-        "u8" => pixels.len() / px_count,
-        "u16" => (pixels.len() / 2) / px_count,
-        "f32" => (pixels.len() / 4) / px_count,
-        _ => {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "Unknown input_dtype",
-            ));
-        }
-    };
     let allow_gpu_fallback = device != "gpu";
 
     // Instantiate the required reader via `bytemuck` without copying RAM
@@ -1270,6 +1361,7 @@ fn encode_avif(
             &ReaderF32 {
                 data: bytemuck::cast_slice(pixels),
                 channels,
+                tone_map,
             },
             width,
             height,
@@ -1298,10 +1390,7 @@ fn encode_avif(
             match estimate_cq(&color_yuv.y, width, height, depth, target_ssim, preset, use_gpu) {
                 Ok(cq) => cq,
                 Err(error) if use_gpu && allow_gpu_fallback => {
-                    eprintln!(
-                        "[nvavif_py] WARN: NVENC auto-CQ probe failed ({}); falling back to CPU.",
-                        error
-                    );
+                    warn_gpu_fallback_once("NVENC auto-CQ probe", &error);
                     use_gpu = false;
                     eprintln!("[nvavif_py] INFO: Estimating auto-CQ via CPU. This may take ~200-500ms extra.");
                     estimate_cq(
@@ -1354,10 +1443,7 @@ fn encode_avif(
                 let color_av1 = match color_result {
                     Ok(data) => data,
                     Err(error) if allow_gpu_fallback => {
-                        eprintln!(
-                            "[nvavif_py] WARN: NVENC color encode failed ({}); falling back to CPU.",
-                            error
-                        );
+                        warn_gpu_fallback_once("NVENC color encode", &error);
                         encode_av1_frame_cpu(
                             width,
                             height,
@@ -1405,10 +1491,7 @@ fn encode_avif(
                     match encode_av1_frame_gpu(width, height, &color_yuv, final_cq, preset) {
                         Ok(data) => data,
                         Err(error) if allow_gpu_fallback => {
-                            eprintln!(
-                                "[nvavif_py] WARN: NVENC color encode failed ({}); falling back to CPU.",
-                                error
-                            );
+                            warn_gpu_fallback_once("NVENC color encode", &error);
                             encode_av1_frame_cpu(
                                 width,
                                 height,
@@ -1477,6 +1560,7 @@ fn encode_avif(
 /// Parallel conversion of YUV video frames to RGB or RGBA pixel data.
 /// Transformation of multi-planar YUV data into interleaved RGB(A) buffers using BT.709 fixed-point math.
 /// Support for 8-bit and 10-bit input depths across 4:2:0, 4:2:2, and 4:4:4 subsampling schemes.
+/// Grayscale (monochrome) frames are broadcast to RGB with neutral chroma.
 /// Normalization of 10-bit data to 8-bit output range.
 /// Row-level parallelization via segmented chunk processing.
 /// Direct implementation to bypass external scaling library overhead.
@@ -1488,8 +1572,13 @@ fn yuv_to_rgb_parallel(decoded: &ffmpeg::frame::Video) -> PyResult<(Vec<u8>, usi
     let (has_alpha, is_10bit) = match format {
         Pixel::YUV420P | Pixel::YUV422P | Pixel::YUV444P => (false, false),
         Pixel::YUV420P10LE | Pixel::YUV422P10LE | Pixel::YUV444P10LE => (false, true),
+        // Grayscale AVIF (monochrome color item, e.g. produced by avifenc -y):
+        // broadcast luma to RGB instead of failing with "Unsupported"
+        // (REVIEW_FINDINGS A6).
+        Pixel::GRAY8 => (false, false),
+        Pixel::GRAY10LE => (false, true),
         Pixel::YUVA420P | Pixel::YUVA422P | Pixel::YUVA444P => (true, false),
-        Pixel::YUVA444P10LE => (true, true),
+        Pixel::YUVA444P10LE | Pixel::YUVA422P10LE => (true, true),
         other => {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
                 "Unsupported: {:?}",
@@ -1509,12 +1598,18 @@ fn yuv_to_rgb_parallel(decoded: &ffmpeg::frame::Video) -> PyResult<(Vec<u8>, usi
 
     let channels = if has_alpha { 4 } else { 3 };
 
+    let is_gray = matches!(format, Pixel::GRAY8 | Pixel::GRAY10LE);
     let y_stride = decoded.stride(0);
-    let u_stride = decoded.stride(1);
-    let v_stride = decoded.stride(2);
+    let u_stride = if is_gray { 0 } else { decoded.stride(1) };
+    let v_stride = if is_gray { 0 } else { decoded.stride(2) };
     let y_data = decoded.data(0);
-    let u_data = decoded.data(1);
-    let v_data = decoded.data(2);
+    // Gray frames carry no chroma planes: AVFrame data[1]/data[2] are NULL,
+    // so the chroma slices must not be created at all.
+    let (u_data, v_data): (&[u8], &[u8]) = if is_gray {
+        (&[], &[])
+    } else {
+        (decoded.data(1), decoded.data(2))
+    };
     let a_data = if has_alpha {
         Some(decoded.data(3))
     } else {
@@ -1550,7 +1645,18 @@ fn yuv_to_rgb_parallel(decoded: &ffmpeg::frame::Video) -> PyResult<(Vec<u8>, usi
                     (x / 2, y_row / 2)
                 };
 
-                let (y_val, cb_val, cr_val) = if is_10bit {
+                let (y_val, cb_val, cr_val) = if is_gray {
+                    // Monochrome item: neutral chroma, no chroma offset on luma.
+                    let y = if is_10bit {
+                        u16::from_le_bytes([
+                            y_data[y_row * y_stride + x * 2],
+                            y_data[y_row * y_stride + x * 2 + 1],
+                        ]) as i32
+                    } else {
+                        y_data[y_row * y_stride + x] as i32
+                    };
+                    (y, 0, 0)
+                } else if is_10bit {
                     let y16 = u16::from_le_bytes([
                         y_data[y_row * y_stride + x * 2],
                         y_data[y_row * y_stride + x * 2 + 1],

@@ -17,7 +17,7 @@ Built as a native Rust extension via [PyO3](https://pyo3.rs/), it bridges the NV
 *   **Alpha Support:** Correctly encodes transparency via a secondary AV1 auxiliary plane with independent quality control.
 *   **Auto-CQ (SSIM-guided quality):** Automatically finds the optimal quantization level to hit a target SSIM perceptual quality score, using a two-probe secant approximation.
 *   **Device Selection:** Explicit `device="gpu"`, `device="cpu"`, or `device="auto"` routing — pin encoding to CPU even when a GPU is present.
-*   **Multi-format Input:** Accepts `uint8`, `uint16`, and `float32` NumPy arrays, including HDR data. Float input is tone-mapped via the ACES Filmic operator before encoding.
+*   **Multi-format Input:** Accepts `uint8`, `uint16`, and `float32` NumPy arrays, including HDR data. Float input with values above 1.0 is tone-mapped via the ACES Filmic operator; `[0, 1]` float input (e.g. `img / 255.0`) passes through unchanged.
 *   **GPU Tensor Support:** Direct ingestion of PyTorch and CuPy GPU tensors — automatically migrated to CPU without user intervention.
 *   **EXIF Embedding:** Raw EXIF metadata can be injected directly into the AVIF container.
 *   **Pillow Plugin:** Auto-registers as a Pillow save handler — use `img.save("out.avif")` directly.
@@ -191,7 +191,7 @@ with open("photo.avif", "wb") as f:
 
 ### Pillow Plugin (Zero-Config, works with CPU fallback too)
 
-`nvavif_py` always registers itself as a Pillow save plugin regardless of GPU availability. No extra imports or setup required:
+`nvavif_py` always registers itself as a Pillow **save** plugin regardless of GPU availability. No extra imports or setup required:
 
 ```python
 from PIL import Image
@@ -213,6 +213,8 @@ img.save("photo.avif", cq=20, device=Device.CPU)
 ```
 
 > The plugin maps Pillow's `quality` parameter (0–100) to `nvavif_py`'s `target_ssim` scale and enables `auto_cq=True` automatically for perceptual quality targeting.
+>
+> **Save only:** the plugin does not register an AVIF *reader*. `Image.open("*.avif")` requires pillow-avif-plugin (or Pillow built with libavif); this library reads AVIF via `decode_file()`, which returns a NumPy array (`Image.fromarray` to get a PIL image back).
 
 ---
 
@@ -249,6 +251,7 @@ nvavif_py.encode_file(
     matrix=ColorMatrix.BT709,           # Color matrix for YUV conversion
     exif=None,                           # Raw EXIF bytes to embed in AVIF
     device=Device.AUTO,                  # "auto", "gpu", or "cpu"
+    with_cq=False,                       # True → returns (bytes, effective_cq) tuple
 )
 ```
 
@@ -264,6 +267,8 @@ nvavif_py.encode_file(
 | PyTorch `Tensor` (GPU/CPU)     | Auto-detached and moved to CPU via `.detach().cpu()` |
 | CuPy `ndarray`                 | Auto-converted via `.get()`                          |
 
+> **Caveats:** animated inputs (GIF, animated WebP) are flattened to their first frame — the library encodes still images only. Files above Pillow's ~178 MP "decompression bomb" guard raise `DecompressionBombError` when loaded from a path; the batch tool disables that guard for legitimate oversized photography.
+
 #### Parameters
 
 | Parameter        | Type             | Default          | Description                                                                                            |
@@ -271,6 +276,8 @@ nvavif_py.encode_file(
 | `cq`             | `int`            | `20`             | Constant quality level. Lower = higher quality, larger file. Clamped 0–51.                             |
 | `auto_cq`        | `bool`           | `False`          | When `True`, ignores `cq` and automatically selects the quantizer to hit `target_quality`.             |
 | `target_quality` | `float`          | `80.0`           | Quality target. Values > 1.0 use a 0–100 scale; values ≤ 1.0 are treated as raw SSIM (e.g. `0.985`).   |
+
+> The 0–100 scale maps to SSIM as `ssim = 1 − 0.5 · ((100 − q) / 100)²` (so 80 → 0.98, 85 → 0.98875, 90 → 0.995); the two-probe secant search then finds the cq that hits it. Values ≤ 1.0 bypass the mapping and are used as the SSIM target directly.
 | `alpha_cq`       | `int \| None`    | `None`           | Quality for alpha channel. If `None`, defaults to `cq - 4` (slightly better than color plane).         |
 | `preset`         | `NvencPreset`    | `P7_MAX_QUALITY` | NVENC preset (P1–P7). Higher = better compression, slightly slower. Also maps to rav1e speed on CPU.   |
 | `depth`          | `ColorDepth`     | `EIGHT_BIT`      | Bit depth per channel: `EIGHT_BIT` or `TEN_BIT`.                                                       |
@@ -278,6 +285,7 @@ nvavif_py.encode_file(
 | `matrix`         | `ColorMatrix`    | `BT709`          | YUV color matrix: `BT709` (HD), `BT601` (SD/legacy), or `BT2020` (wide gamut/HDR).                     |
 | `exif`           | `bytes \| None`  | `None`           | Raw EXIF metadata bytes to embed in the AVIF container.                                                |
 | `device`         | `Device \| str`  | `Device.AUTO`    | `"auto"` = prefer GPU; `"gpu"` = force GPU (raises if unavailable); `"cpu"` = force rav1e CPU encoder. |
+| `with_cq`        | `bool`           | `False`          | When `True`, returns a `(bytes, cq)` tuple where `cq` is the effective color-plane CQ (the value chosen by auto-CQ when enabled). |
 
 #### Automatic Preprocessing
 
@@ -304,6 +312,11 @@ When the input is a PIL Image or a file path/bytes, the following preprocessing 
 > **Note:** NVENC requires image dimensions to be **even numbers**.
 > 
 > Odd-dimensioned images are automatically cropped by 1 pixel on the right or bottom edge.
+>
+> **Hardware limits:** NVENC also enforces a maximum of 8192 pixels per axis
+> and a small minimum frame size — measured on RTX 40: **width ≥ 130, height
+> ≥ 66** (smaller images transparently take the CPU path). See
+> `DEVELOPMENT_NOTES.md` §12 for measurements.
 
 ---
 
@@ -403,6 +416,8 @@ img_array = nvavif_py.decode_file("photo.avif", threads=0)
 | Type            | Description                                                                                         |
 |-----------------|-----------------------------------------------------------------------------------------------------|
 | `numpy.ndarray` | Decoded image with shape `(height, width, channels)`, dtype `uint8`. Channels: 3 (RGB) or 4 (RGBA). |
+
+> **Note:** The returned array is a **read-only, zero-copy view**. Call `.copy()` on it if you need to modify pixels in place (some torchvision/OpenCV pipelines mutate input arrays).
 
 #### Threading Recommendations
 
@@ -552,6 +567,8 @@ avif_data = nvavif_py.encode_file(
 ```
 
 > **ACES Filmic formula:** `f(x) = (x*(2.51x + 0.03)) / (x*(2.43x + 0.59) + 0.14)`, clamped to [0, 1]. Preserves highlight detail without hard clipping.
+>
+> Tone mapping **only engages when the float data actually exceeds 1.0** (checked via `max()`). Standard SDR float input such as `img / 255.0` is encoded without any brightness modification.
 
 ### PyTorch / CuPy GPU Tensor Input
 

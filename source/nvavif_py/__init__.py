@@ -106,7 +106,7 @@ def _ensure_srgb(img: Image.Image) -> Image.Image:
             src_profile = ImageCms.ImageCmsProfile(io.BytesIO(icc))
             srgb_profile = ImageCms.createProfile('sRGB')
             return ImageCms.profileToProfile(img, src_profile, srgb_profile)
-        except:
+        except Exception:
             pass
     return img
 
@@ -309,17 +309,25 @@ def encode_file(
 
     if img_array.dtype == np.uint8:
         dtype_str = DataType.U8
+        tone_map = False
     elif img_array.dtype == np.uint16:
         dtype_str = DataType.U16
+        tone_map = False
     elif np.issubdtype(img_array.dtype, np.floating):
         # Enforce 32-bit Float for NN tensors
         if img_array.dtype != np.float32:
             img_array = img_array.astype(np.float32)
         dtype_str = DataType.F32
+        # ACES tone mapping is an HDR (max > 1.0) operation: LDR float input
+        # such as img / 255.0 passes through unchanged, matching the
+        # documented behavior (previously every float input was brightened
+        # ~6% in the midtones by the ACES curve — REVIEW_FINDINGS A4).
+        tone_map = bool(np.nanmax(img_array) > 1.0) if img_array.size else False
     else:
         # Fallback for int32 / bool
         img_array = img_array.astype(np.uint8)
         dtype_str = DataType.U8
+        tone_map = False
 
     # Quality Perception Scale
     if target_quality <= 1.0:
@@ -343,7 +351,8 @@ def encode_file(
         chroma=chroma,
         matrix=matrix,
         exif=exif,
-        device=device
+        device=device,
+        tone_map=tone_map
     )
     if with_cq:
         return data, chosen_cq
@@ -365,7 +374,9 @@ def decode_file(path: str | Path, threads: int = 0) -> np.ndarray:
 
     Returns:
         np.ndarray: Decoded image as a numpy.ndarray with shape
-            (height, width, channels) and uint8 data type.
+            (height, width, channels) and uint8 data type. The array is a
+            read-only view (zero-copy); call ``.copy()`` on it if you need
+            to modify pixels in place.
 
     Raises:
         FileNotFoundError: If the file at the specified path is not found.

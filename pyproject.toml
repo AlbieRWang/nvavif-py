@@ -6,6 +6,7 @@ build-backend = "maturin"
 name = "nvavif_py"
 readme = "README.md"
 description = "High-performance Python library for encoding/decoding AVIF images using NVIDIA hardware acceleration (NVENC)."
+license = { text = "MIT" }
 dynamic = ["version"]
 dependencies = [
     "pillow",
@@ -14,8 +15,13 @@ dependencies = [
 requires-python = ">=3.10"
 classifiers = [
     "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Programming Language :: Python :: Implementation :: CPython",
-    "Programming Language :: Python :: Implementation :: PyPy",
 ]
 [tool.uv]
 # The root project must NOT be installed by uv: `uv run` would otherwise
