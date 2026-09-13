@@ -71,6 +71,15 @@ jobs:
             make install
             cd ..
 
+      - name: Repair wheels with auditwheel (bundle FFmpeg shared libs)
+        # Without repair the wheel carries bare DT_NEEDED refs to the system
+        # libavcodec/libavutil built here, so pip users without FFmpeg get an
+        # ImportError and the "wheels bundle all libraries" promise is false.
+        # NVENC is loaded by dlopen at runtime, so no CUDA libs need excluding.
+        run: |
+          auditwheel repair dist/*.whl --plat manylinux_2_28_x86_64 -w dist/repaired
+          mv dist/repaired/*.whl dist/
+
       - name: Upload wheels
         uses: actions/upload-artifact@v6
         with:
@@ -176,6 +185,34 @@ jobs:
           name: wheels-windows-${{ matrix.target }}
           path: dist
 
+
+  smoke-linux:
+    # CPU-only roundtrip on a GPU-less runner: proves the repaired wheel is
+    # self-contained (imports without system FFmpeg) and the rav1e/dav1d
+    # paths work. Informational — does not gate the release job.
+    runs-on: ubuntu-latest
+    needs: [linux]
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: wheels-linux-x86_64
+          path: dist
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Install wheel + roundtrip
+        run: |
+          python -m pip install --only-binary :all: dist/*.whl numpy pillow
+          python - <<'EOF'
+          import numpy as np
+          import nvavif_py as nv
+          img = (np.random.default_rng(0).random((256, 256, 3)) * 255).astype(np.uint8)
+          data = nv.encode_file(img, device="cpu", cq=20)
+          open("t.avif", "wb").write(data)
+          arr = nv.decode_file("t.avif")
+          assert arr.shape == (256, 256, 3) and arr.dtype == np.uint8
+          print("smoke OK:", len(data), "bytes, decoded", arr.shape)
+          EOF
 
   sdist:
     runs-on: ubuntu-latest
