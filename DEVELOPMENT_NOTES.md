@@ -710,13 +710,15 @@ WIC 注意事项：WPF `CopyPixels` 查询对 alpha HEIC 一律返回 `Bgr32` �
 | 层面 | 指标 | 实现/位置 | 用途 |
 |---|---|---|---|
 | 编码闭环（每图自动） | 8×8 块状 SSIM（仅亮度） | `src/lib.rs` `calculate_ssim` | auto_cq 校准到 target 0.88；试编码固定 512×512 |
-| 感知评估（人工跑） | LPIPS（alex, torch）+ ΔE2000 worst-1% + 简化色度 PSNR | `uvtest/compare_perceptual.py`、`compare_runs.py` | 格式/配置取舍的最终裁判 |
+| 感知评估（人工跑） | LPIPS（alex, torch）；ΔE2000 worst-1% 仅色度专项辅助 | `uvtest/compare_perceptual.py`、`compare_runs.py` | 最终裁判 = LPIPS + 人工核验 |
 | 回归报警（自动） | SSIM / PSNR / alpha MAE | `uvtest/quality_metrics.py`、`cargo test` | 同路径回归比较，不做观感预测 |
 
 要点（完整方法论见 OPTIMIZATION_PROPOSALS.md 开头"度量方法说明"）：
 
 - 分块 SSIM 对高频/硬边缘**偏保守**（实测 SSIM 0.925 的图人工不可辨，合成白底后 LPIPS 0.003~0.005），
   只当回归检测器，不当观感预测器；"看起来一样吗"这类问题以 LPIPS 为准（<0.05 ≈ 不可辨）。
+- **ΔE2000 不是独立判断依据**：简化实现（hue-mean）仅作同路径内相对比较；`compare_runs.py` 默认关闭
+  （最贵指标 ~3-6× LPIPS，LPIPS 已覆盖观感结论），仅在专项排查 4:2:0 色度渗色时开启。
 - RGBA 算任何指标前必须**先合成到背景色**，否则透明像素下方无意义的 RGB 会污染数值。
 - LPIPS 数值仅在同一网络（alex）、同类失真间可比；torch 为 CPU 版，`compare_runs.py` 的
   感知子集限 ≤4MP 源。ΔE2000/色度 PSNR 为简化实现，仅限同一路径内相对比较。

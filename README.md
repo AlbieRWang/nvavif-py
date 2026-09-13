@@ -882,7 +882,7 @@ nvavif_py.encode_file("photo.png", cq=20, device=Device.CPU)   # explicit CPU
 ## Quality Metrics
 
 - **Closed-loop, per image (automatic):** a fast block-wise SSIM (8×8 blocks, luma only, implemented in `src/lib.rs`) drives auto_cq — the encoder picks the CQ that hits the SSIM target (default 0.88) measured on a 512×512 trial encode.
-- **Perceptual verdicts (manual comparison runs):** LPIPS (alex) + ΔE2000 worst-1% in `uvtest/compare_perceptual.py` and `uvtest/compare_runs.py` — format and configuration trade-offs are judged here, with RGBA inputs composited over white first. Needs the optional `lpips` dependency (torch; CPU build is fine, the perceptual subset is capped at ~4 MP sources).
+- **Perceptual verdicts (manual comparison runs):** LPIPS (alex) in `uvtest/compare_perceptual.py` and `uvtest/compare_runs.py` — format and configuration trade-offs are judged on LPIPS plus human spot-checks, with RGBA inputs composited over white first. ΔE2000 worst-1% is an opt-in auxiliary (`--de2000`, off by default) used only when hunting 4:2:0 chroma fringing — not a standalone verdict. Needs the optional `lpips` dependency (torch; CPU build is fine, the perceptual subset is capped at ~4 MP sources).
 - **Regression alarms (automated):** SSIM / PSNR / alpha-MAE helpers in `uvtest/quality_metrics.py` and the `cargo test` suite.
 
 Block SSIM is deliberately conservative on hard edges: images at SSIM ~0.925 are usually visually indistinguishable (LPIPS 0.003–0.005, where <0.05 ≈ indistinguishable), so use LPIPS — not SSIM — to answer "does it look the same". Methodology details: `DEVELOPMENT_NOTES.md` §19 and the measurement note atop `OPTIMIZATION_PROPOSALS.md`.
