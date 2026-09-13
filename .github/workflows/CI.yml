@@ -78,13 +78,22 @@ jobs:
             make -j$(nproc)
             make install
             cd ..
+            # The maturin container is ephemeral — copy the shared libs into
+            # the workspace so the later host-side auditwheel step can find
+            # and bundle them (dav1d is static, nv-codec-headers are headers).
+            mkdir -p ffmpeg-host-lib
+            cp -a /usr/lib64/libav*.so* /usr/lib64/libsw*.so* ffmpeg-host-lib/ \
+              || cp -a /usr/lib/libav*.so* /usr/lib/libsw*.so* ffmpeg-host-lib/
 
       - name: Repair wheels with auditwheel (bundle FFmpeg shared libs)
         # Without repair the wheel carries bare DT_NEEDED refs to the system
         # libavcodec/libavutil built here, so pip users without FFmpeg get an
         # ImportError and the "wheels bundle all libraries" promise is false.
         # NVENC is loaded by dlopen at runtime, so no CUDA libs need excluding.
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/ffmpeg-host-lib
         run: |
+          pip install auditwheel patchelf
           auditwheel repair dist/*.whl --plat manylinux_2_28_x86_64 -w dist/repaired
           mv dist/repaired/*.whl dist/
 
