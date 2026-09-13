@@ -698,3 +698,6 @@ WIC 注意事项：WPF `CopyPixels` 查询对 alpha HEIC 一律返回 `Bgr32` �
 - 遗留运维注意（非代码）：图库保持子目录结构（NTFS 单目录百万文件变慢）；输出目录加 Defender 排除；
   8192 级大图 ×8 worker 的显存峰值可能静默 CPU 回退（报表按 `mp_per_s` 离群检测）；auto 模式
   workers=8 时 capacity=1 会话复用≈0（每图 ~3 次开上下文 ≈240 ms），可试 workers=4 权衡。
+- **Windows 长路径（2026-09-13）**：100k+ 语料 + 深子目录时，未开启系统长路径的机器上
+  `rglob`/写入可能在 >260 字符路径上失败并计入 `failures`（不会中断运行）。规避：注册表开启
+  `LongPathsEnabled`（或 git `core.longpaths=true`），或保持目录层级浅、文件名短。

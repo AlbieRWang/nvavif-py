@@ -119,6 +119,13 @@ NVENC_SESSION_LIMIT = 8
 # fallback path, which is orders of magnitude slower per megapixel.
 NVENC_MAX_DIMENSION = 8192
 
+# NVENC practical minimum, measured on RTX 4070 (2026-09-13): av1_nvenc
+# refuses sessions below ~130 wide / ~66 high and the library silently falls
+# back to CPU rav1e — for sub-100px sources that detour buys nothing, so the
+# batch tool skips them outright instead of force-compat-ing the slow path.
+NVENC_MIN_WIDTH = 130
+NVENC_MIN_HEIGHT = 66
+
 # WebP format limit (Pillow raises above this).
 WEBP_MAX_DIMENSION = 16383
 
@@ -256,7 +263,12 @@ def _encode_task(task: dict) -> dict:
     lossless = False
     transparent_route = False
     fmt = task["transparent_format"]
-    if fmt != "avif":
+    # Pixel-level transparency check only when the header claims an alpha
+    # channel (probe_cost): an opaque-header JPEG/PNG cannot sprout alpha
+    # pixels, and the full decode + RGBA convert costs 0.2-0.4 s per 12 MP
+    # source for nothing (REVIEW_FINDINGS B1). width == 0 (unreadable
+    # header) keeps the old always-check behavior as a fallback.
+    if fmt != "avif" and (task.get("has_alpha") or not task.get("width")):
         with Image.open(path) as im:
             alpha_lo, _ = im.convert("RGBA").getchannel("A").getextrema()
         if alpha_lo < 255 and (fmt == "png" or webp_fits):
@@ -295,27 +307,30 @@ def _encode_task(task: dict) -> dict:
         with Image.open(path) as im:
             src_exif = im.info.get("exif")
             src_icc = im.info.get("icc_profile")
-            rgba = im.convert("RGBA")
+            # Only the transparent route needs the alpha plane; on the
+            # oversize/opaque routes an all-opaque alpha channel costs WebP
+            # bytes and encode time for nothing (REVIEW_FINDINGS B8).
+            enc_img = im.convert("RGBA") if transparent_route else im.convert("RGB")
         if src_exif:
             # Match the AVIF route (encode_file wrapper): physically apply the
             # EXIF orientation so the output shows what every viewer showed
             # for the source; the returned image's EXIF has the orientation
             # tag removed, so viewers won't rotate the correct pixels again.
-            rgba = ImageOps.exif_transpose(rgba)
-            src_exif = rgba.info.get("exif")
-            if rgba.size != (orig_width, orig_height):
+            enc_img = ImageOps.exif_transpose(enc_img)
+            src_exif = enc_img.info.get("exif")
+            if enc_img.size != (orig_width, orig_height):
                 # Transposed (90° orientation): header dims no longer describe
                 # the pixels — swap them and recompute the resize target.
-                orig_width, orig_height = rgba.size
+                orig_width, orig_height = enc_img.size
                 width, height = orig_width, orig_height
                 if need_resize:
                     scale = resize_limit / max(orig_width, orig_height)
                     width = max(1, int(orig_width * scale))
                     height = max(1, int(orig_height * scale))
             if need_resize:
-                rgba = rgba.resize((width, height), Image.LANCZOS)
+                enc_img = enc_img.resize((width, height), Image.LANCZOS)
         elif need_resize:
-            rgba = rgba.resize((width, height), Image.LANCZOS)
+            enc_img = enc_img.resize((width, height), Image.LANCZOS)
         # WebP/PNG containers carry ICC and EXIF natively, so embed both
         # as-is — wide-gamut sources keep their profile instead of being
         # silently reinterpreted as sRGB. (The AVIF route converts pixels to
@@ -332,9 +347,9 @@ def _encode_task(task: dict) -> dict:
             # never take the original down with it.
             tmp_path = out_path.with_name(out_path.stem + ".tmp" + out_path.suffix)
             if whole_format == "webp":
-                rgba.save(tmp_path, "WEBP", quality=quality, lossless=lossless, method=method, **save_meta)
+                enc_img.save(tmp_path, "WEBP", quality=quality, lossless=lossless, method=method, **save_meta)
             else:
-                rgba.save(tmp_path, "PNG", **save_meta)
+                enc_img.save(tmp_path, "PNG", **save_meta)
             out_bytes = tmp_path.stat().st_size
             if task["keep_smaller"] and out_bytes >= src_bytes:
                 tmp_path.unlink()
@@ -354,9 +369,9 @@ def _encode_task(task: dict) -> dict:
                 path.unlink()
         else:
             if whole_format == "webp":
-                rgba.save(out_path, "WEBP", quality=quality, lossless=lossless, method=method, **save_meta)
+                enc_img.save(out_path, "WEBP", quality=quality, lossless=lossless, method=method, **save_meta)
             else:
-                rgba.save(out_path, "PNG", **save_meta)
+                enc_img.save(out_path, "PNG", **save_meta)
             out_bytes = out_path.stat().st_size
             if task["keep_smaller"] and out_bytes >= src_bytes:
                 out_path.unlink()
@@ -394,7 +409,7 @@ def _encode_task(task: dict) -> dict:
             },
         }
 
-    kwargs = {"device": task["device"]}
+    kwargs = {"device": task["device"], "preset": task["preset"]}
     if task["auto_quality"] is not None:
         kwargs.update(auto_cq=True, target_quality=task["auto_quality"])
     else:
@@ -577,6 +592,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="disable auto-CQ calibration and encode opaque images at the fixed --cq (benchmark mode; default: auto)",
     )
     parser.add_argument("--device", choices=["auto", "gpu", "cpu"], default="auto")
+    parser.add_argument(
+        "--preset",
+        type=int,
+        choices=[1, 2, 3, 4, 5, 6, 7],
+        default=7,
+        help="NVENC preset 1-7 for the AVIF route (default 7 = best compression; lower is faster but larger. Also slows the rav1e CPU fallback, which inherits this preset)",
+    )
     parser.add_argument("--workers", type=int, default=None, help="parallel encode processes (default: min(8, cores/2); NVENC session limit is the hard cap)")
     parser.add_argument("--limit", type=int, default=None, help="only process the first N images (smoke test)")
     parser.add_argument(
@@ -695,6 +717,15 @@ def effective_config(args: argparse.Namespace) -> dict:
 
 
 def main() -> None:
+    # Redirected stdout/stderr use the locale codec (e.g. cp936 on Chinese
+    # Windows); a 100k-source run WILL contain names outside it and a print
+    # would raise UnicodeEncodeError mid-run. UTF-8 with replacement keeps
+    # the console output lossy-but-alive (reports/stream.jsonl are always
+    # real UTF-8 files).
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
     parser = build_parser()
     argv = sys.argv[1:]
     # First pass: only resolve --config so the file can seed the defaults; the
@@ -740,8 +771,35 @@ def main() -> None:
     tasks = []
     skipped_quality: list[dict] = []
     skipped_animated: list[dict] = []
+    skipped_small: list[dict] = []
+    skipped_prev_kept: list[str] = []
     seen_stems: dict[Path, set] = {}
     out_exts = ("avif", "webp", "png")
+    # Rerun skip (C2): sources the previous run kept as-is (keep-smaller
+    # guard) are already in the output folder — re-encoding them costs a full
+    # decode + encode to reach the same verdict. --overwrite re-encodes them.
+    prev_kept: set[str] = set()
+    if not args.overwrite and args.report != Path("none"):
+        prev_report = args.report if args.report.is_absolute() else args.dst / args.report
+        prev_stream = prev_report.parent / (prev_report.stem + ".stream.jsonl")
+        if prev_stream.exists():
+            same_src = True
+            try:
+                for line in prev_stream.read_text(encoding="utf-8", errors="replace").splitlines():
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if row.get("stream"):
+                        if row.get("src") != str(args.src):
+                            same_src = False
+                            break
+                    elif row.get("action") == "kept_source" and row.get("name"):
+                        prev_kept.add(row["name"])
+            except OSError:
+                same_src = False
+            if not same_src:
+                prev_kept = set()
     for i, path in enumerate(files, 1):
         rel = path.relative_to(args.src)
         out_dir = args.dst / rel.parent
@@ -764,6 +822,10 @@ def main() -> None:
             if exists:
                 print(f"[{i}/{len(files)}] skip (exists): {rel.as_posix()}.*")
                 continue
+        if rel.as_posix() in prev_kept:
+            skipped_prev_kept.append(rel.as_posix())
+            print(f"[{i}/{len(files)}] skip (kept as source by previous run): {rel.as_posix()}")
+            continue
         # Animated content (GIF — the format is skipped entirely per policy —
         # and animated WebP) is out of scope for the still-image pipeline:
         # whole-image WebP/AVIF would silently flatten it to its first frame.
@@ -775,6 +837,17 @@ def main() -> None:
                 out_dir.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(path, out_dir / path.name)
             print(f"[{i}/{len(files)}] skip ({reason}): {rel.as_posix()}")
+            continue
+        # Below the NVENC practical minimum (measured RTX 4070, see the
+        # NVENC_MIN_* constants) the GPU session is refused and the encode
+        # silently falls back to CPU rav1e — skip instead. width == 0
+        # (unreadable header) keeps the old always-encode behavior.
+        pw, ph = probe.get("width", 0) or 0, probe.get("height", 0) or 0
+        if 0 < pw < NVENC_MIN_WIDTH or 0 < ph < NVENC_MIN_HEIGHT:
+            skipped_small.append({"name": rel.as_posix(), "width": pw, "height": ph, "src_bytes": path.stat().st_size})
+            if args.copy_skipped and not args.in_place:
+                shutil.copy2(path, out_dir / path.name)
+            print(f"[{i}/{len(files)}] skip (below NVENC min {NVENC_MIN_WIDTH}x{NVENC_MIN_HEIGHT}): {rel.as_posix()}")
             continue
         # Pre-filter: a JPEG already compressed harder than our cq target can
         # only grow or waste encode time — keep it and move on (zero cost).
@@ -797,6 +870,7 @@ def main() -> None:
                 "cq": args.cq,
                 "auto_quality": args.auto_quality,
                 "device": args.device,
+                "preset": args.preset,
                 "keep_smaller": args.keep_smaller,
                 "copy_skipped": args.copy_skipped and not args.in_place,
                 "in_place": args.in_place,
@@ -847,6 +921,10 @@ def main() -> None:
     kept_source = 0
     failures: list[str] = []
     rows: list[dict] = []
+    # Initialized outside `if tasks:` — a fully-resumed rerun (every source
+    # already handled) reaches the report write with zero tasks and used to
+    # die there with UnboundLocalError on `interrupted`.
+    interrupted = False
     started = time.perf_counter()
 
     sampler = ResourceSampler()
@@ -867,7 +945,6 @@ def main() -> None:
                 "stream": True, "src": str(args.src), "dst": str(args.dst),
                 "cq": args.cq, "auto_quality": args.auto_quality,
             }) + "\n")
-        interrupted = False
         pool = None
         try:
             with ProcessPoolExecutor(max_workers=workers, max_tasks_per_child=10000) as pool:
@@ -964,8 +1041,12 @@ def main() -> None:
         print(f"animated: {len(skipped_animated)} GIF/animated-WebP sources skipped (still-image pipeline)")
     if kept_source:
         print(f"guard: {kept_source} images kept as source (AVIF was not smaller)")
-    if args.copy_skipped and not args.in_place and (kept_source or skipped_quality or skipped_animated):
-        print(f"copy-skipped: {kept_source + len(skipped_quality) + len(skipped_animated)} sources copied unchanged into the output folder")
+    if skipped_small:
+        print(f"small: {len(skipped_small)} sources below the NVENC minimum kept as-is")
+    if skipped_prev_kept:
+        print(f"rerun: {len(skipped_prev_kept)} sources already kept as-is by the previous run skipped")
+    if args.copy_skipped and not args.in_place and (kept_source or skipped_quality or skipped_animated or skipped_small):
+        print(f"copy-skipped: {kept_source + len(skipped_quality) + len(skipped_animated) + len(skipped_small)} sources copied unchanged into the output folder")
     if total_px:
         print(
             f"encoded: {total_px/1e6:.1f} MP, throughput {total_px/1e6/max(elapsed,1e-6):.2f} MP/s, "
@@ -973,7 +1054,7 @@ def main() -> None:
             f"saved {100*(1-total_out/max(total_in,1)):.0f}%)"
         )
         final_store = total_out + kept_src_bytes
-        src_all = total_in + kept_src_bytes + sum(s["src_bytes"] for s in skipped_quality)
+        src_all = total_in + kept_src_bytes + sum(s["src_bytes"] for s in skipped_quality) + sum(s["src_bytes"] for s in skipped_small)
         print(
             f"overall storage: {src_all/1e6:.1f} MB -> {final_store/1e6:.1f} MB "
             f"({src_all/max(final_store,1):.2f}x, saved {100*(1-final_store/max(src_all,1)):.0f}%)"
@@ -998,6 +1079,7 @@ def main() -> None:
             "cq": args.cq,
             "auto_quality": args.auto_quality,
             "device": args.device,
+            "preset": args.preset,
             "workers": workers,
             "min_jpeg_quality": args.min_jpeg_quality,
             "keep_smaller": args.keep_smaller,
@@ -1022,6 +1104,8 @@ def main() -> None:
                 "kept_source_bigger": kept_source,
                 "skipped_low_quality_jpeg": len(skipped_quality),
                 "skipped_animated": len(skipped_animated),
+                "skipped_small": len(skipped_small),
+                "rerun_skipped_prev_kept": len(skipped_prev_kept),
                 "resized": n_resized,
                 "elapsed_s": round(elapsed, 2),
                 "total_megapixels": round(total_px / 1e6, 2),
@@ -1035,6 +1119,7 @@ def main() -> None:
             "resource": resource,
             "skipped_quality_jpeg": skipped_quality,
             "skipped_animated": skipped_animated,
+            "skipped_small": skipped_small,
             "images": rows,
         }
         report_path.parent.mkdir(parents=True, exist_ok=True)

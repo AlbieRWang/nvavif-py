@@ -21,10 +21,12 @@
 | R5 | oversize & (>16383 或 `--oversize-format avif`) | AVIF CPU 回退 | `OVERSIZE_RAV1E_PRESET`=speed 7 |
 | R6 | `--oversize-max-edge N` 且长边 > N 且路由为 webp | LANCZOS 等比缩到 N 后按 R1/R2/R4 走 | 逐图记录 `resized_from`；AVIF 路由永不缩放 |
 | R7 | 其余（不透明、常量不透明 RGBA、非 oversize） | GPU AVIF | cq=`--cq`(20) 或 auto_cq=`--auto-quality` |
-| R8 | `--opaque-format webp` 且非 oversize & webp_fits | 整图 WebP | q=`--opaque-webp-quality`(90)，method=`--webp-method` |
+| R8 | `--opaque-format webp` 且非 oversize & webp_fits | 整图 WebP | q=`--opaque-webp-quality`(90)，method=`--webp-method`(4)；不透明源以 **RGB** 编码，不再引入全不透明 alpha 平面（2026-09-13）；真透明走 R1 仍保留 alpha |
 | R9 | JPEG 且估计 IJG 质量 < `--min-jpeg-quality`(85) | 跳过（`skipped_quality_jpeg`），默认拷贝原样 | 量化表估计失败(q=0)不跳过 |
 | R10 | GIF 或动图 WebP（头信息探测） | 跳过（`skipped_animated`），默认拷贝原样 | 静帧管线会拍扁动图 |
 | R11 | `--keep-smaller`(默认 on) 且输出 ≥ 源大小 | 保留源（`action=kept_source`），不写输出 | in-place 时临时文件删除、源不动 |
+| R12 | 宽 < `NVENC_MIN_WIDTH`(130) 或高 < `NVENC_MIN_HEIGHT`(66)（RTX 4070 实测，2026-09-13） | 扫描阶段跳过（`skipped_small`），`--copy-skipped` 时照常拷贝 | 不再为亚最小尺寸源走 CPU rav1e 回落（GPU 优先策略）；宽/高 =0（头不可读）不跳过 |
+| R13 | 重跑且 `--report` 的 `<report>.stream.jsonl` 存在、header `src` 与本次相同、非 `--overwrite` | 上一轮 `action=kept_source` 的源直接跳过，计入 `summary.rerun_skipped_prev_kept` | 2026-09-13 新增；避免增量重跑时对已判定"压不小"的源重复编码 |
 
 注意：R6 的缩放尺寸必须基于**转正后**的像素尺寸（见 M2）——90° 方向标记的长边在缩放前后会交换宽高。
 
