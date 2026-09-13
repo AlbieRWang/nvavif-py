@@ -701,3 +701,23 @@ WIC 注意事项：WPF `CopyPixels` 查询对 alpha HEIC 一律返回 `Bgr32` �
 - **Windows 长路径（2026-09-13）**：100k+ 语料 + 深子目录时，未开启系统长路径的机器上
   `rglob`/写入可能在 >260 字符路径上失败并计入 `failures`（不会中断运行）。规避：注册表开启
   `LongPathsEnabled`（或 git `core.longpaths=true`），或保持目录层级浅、文件名短。
+
+## 19. 质量评估指标体系速览（2026-09-14）
+
+动机：指标方法论此前只写在 OPTIMIZATION_PROPOSALS.md 开头的度量说明与 uvtest/README 的脚本索引里，
+主文档（README/本文件）无索引——想知道"项目用什么指标评判画质"必须翻辅助文档。三层分工：
+
+| 层面 | 指标 | 实现/位置 | 用途 |
+|---|---|---|---|
+| 编码闭环（每图自动） | 8×8 块状 SSIM（仅亮度） | `src/lib.rs` `calculate_ssim` | auto_cq 校准到 target 0.88；试编码固定 512×512 |
+| 感知评估（人工跑） | LPIPS（alex, torch）+ ΔE2000 worst-1% + 简化色度 PSNR | `uvtest/compare_perceptual.py`、`compare_runs.py` | 格式/配置取舍的最终裁判 |
+| 回归报警（自动） | SSIM / PSNR / alpha MAE | `uvtest/quality_metrics.py`、`cargo test` | 同路径回归比较，不做观感预测 |
+
+要点（完整方法论见 OPTIMIZATION_PROPOSALS.md 开头"度量方法说明"）：
+
+- 分块 SSIM 对高频/硬边缘**偏保守**（实测 SSIM 0.925 的图人工不可辨，合成白底后 LPIPS 0.003~0.005），
+  只当回归检测器，不当观感预测器；"看起来一样吗"这类问题以 LPIPS 为准（<0.05 ≈ 不可辨）。
+- RGBA 算任何指标前必须**先合成到背景色**，否则透明像素下方无意义的 RGB 会污染数值。
+- LPIPS 数值仅在同一网络（alex）、同类失真间可比；torch 为 CPU 版，`compare_runs.py` 的
+  感知子集限 ≤4MP 源。ΔE2000/色度 PSNR 为简化实现，仅限同一路径内相对比较。
+- VMAF 未使用（视频向指标，需 libvmaf），图片场景由 LPIPS 承担该角色。
