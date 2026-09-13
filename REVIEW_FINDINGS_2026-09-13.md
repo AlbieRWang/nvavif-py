@@ -87,7 +87,7 @@
 既有文档里已记录的问题(NVENC 8192 轴上限、YUV444 GPU 不稳、alpha 仅 CPU、
 avif-serialize 不能嵌 ICC、rav1e asm bug 等)**不在此重复立项**,见第 6 节。
 
-本轮新发现 **11 项正确性/健壮性问题、9 项性能机会、7 项构建/CI/文档补充**。
+本轮新发现 **11 项正确性/健壮性问题、9 项性能机会、7 项构建/CI/文档补充**(全部闭环)。
 审查时点名的"最值得先做的五件事"(1 灰度 panic、2 cq=0 静默回落、3 批处理
 重复解码探测、4 auto_cq stderr 无开关、5 Linux wheel 未 auditwheel)——
 前 4 项与第 5 项的 CI 修复均已于 2026-09-13 两轮实施中落地,详见第 0.5 节与
@@ -402,11 +402,15 @@ avif-serialize 不能嵌 ICC、rav1e asm bug 等)**不在此重复立项**,见�
 
 ### 审查项最终台账(截至 2026-09-13 第三轮结束,⏸ 清零)
 
-- **已落地并通过验证(27 项)**:A1–A4、A6(GRAY)、A8、A9、A11(部分)、B1–B4、
-  B8、B9、C1、C2、C3、C4、C5、D3、D4、D5、D6、E1、E3,及 D1/D2(代码就绪待 CI 实跑);
+- **已落地并通过验证(29 项)**:A1–A4、A6(GRAY)、A8、A9、A11(部分)、B1–B4、
+  B8、B9、C1、C2、C3、C4、C5、D1、D2、D3、D4、D5、D6、E1、E3
+  ——D1/D2 于 2026-09-13 经真实 CI 三轮修复后**全绿确认**(见上节);
 - **明确不做(5 项,理由见条目)**:B5(GPU 优先策略)、B6(微优化不可测)、
   B7(解码已够快)、A7(仅影响第三方 limited-range 解码)、A10(不加 API 表面);
-- **外部依赖**:D1/D2 的 auditwheel repair 与 smoke-linux job 需要下次 push 触发真 CI 才能确认。
+- **CI 实跑确认(2026-09-13,run 34760722418)**:sdist / windows(11m46s)/
+  linux(4m34s,auditwheel 捆绑 FFmpeg 共享库)/ smoke-linux(装 wheel 无系统
+  FFmpeg 依赖,CPU roundtrip `smoke OK: 62534 bytes, decoded (256, 256, 3)`)全部通过,
+  为该工作流史上首次绿;审查闭环,无遗留。
 
 ---
 
