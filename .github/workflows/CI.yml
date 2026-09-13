@@ -1,14 +1,14 @@
 name: CI
 
 on:
+  # Manual runs only (GitHub → Actions → CI → "Run workflow"), plus release
+  # tags. Per-push builds were removed 2026-09-13: the pipeline has no GPU
+  # (NVENC untestable) and no image corpus, so it adds noise instead of
+  # signal — it exists to produce distributable wheels on demand.
+  workflow_dispatch:
   push:
-    branches:
-      - main
-      - master
     tags:
       - '*'
-  pull_request:
-  workflow_dispatch:
 
 permissions:
   contents: read
