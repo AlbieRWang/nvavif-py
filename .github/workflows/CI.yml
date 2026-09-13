@@ -222,8 +222,10 @@ jobs:
         with:
           python-version: '3.13'
       - name: Install wheel + roundtrip
+        # the artifact holds one wheel per CPython (maturin --find-interpreter):
+        # --find-links lets pip pick the one matching this job's interpreter
         run: |
-          python -m pip install --only-binary :all: dist/*.whl numpy pillow
+          python -m pip install --only-binary :all: --find-links dist nvavif_py numpy pillow
           python - <<'EOF'
           import numpy as np
           import nvavif_py as nv
