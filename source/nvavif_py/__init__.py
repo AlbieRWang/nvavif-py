@@ -157,6 +157,52 @@ def _register_pillow_plugin():
     Image.register_mime('AVIF', 'image/avif')
 
 
+# Exif tag id for Orientation (ExifTags.Base.Orientation).
+_ORIENTATION_TAG = 0x0112
+
+
+def _normalize_exif_payload(raw: bytes | None, *, drop_orientation: bool) -> bytes | None:
+    """Convert a caller-supplied EXIF blob into a HEIF/AVIF Exif item payload.
+
+    A HEIF Exif item payload is a 4-byte big-endian offset to the TIFF header
+    followed by the TIFF block — *not* the JPEG/WebP form. Callers hand us either
+    that JPEG/WebP form (``b"Exif\\x00\\x00" + TIFF``) or an already-conformant
+    payload. Anything unrecognized is dropped: libavif rejects the whole file
+    with "Invalid Exif payload" instead of skipping a malformed item, so embedding
+    a bad payload would make the output unopenable.
+
+    When the pixels were physically transposed (``ImageOps.exif_transpose``), the
+    Orientation tag is removed so viewers do not rotate a second time.
+    """
+    if not raw:
+        return None
+    data = bytes(raw)
+    while data.startswith(b"Exif\x00\x00"):
+        data = data[6:]
+    if data[4:8] in (b"II*\x00", b"MM\x00*"):
+        pass  # already carries the 4-byte offset
+    elif data[:4] in (b"II*\x00", b"MM\x00*"):
+        data = b"\x00\x00\x00\x00" + data
+    else:
+        return None
+
+    if drop_orientation:
+        tiff = data[4:] if data[:4] == b"\x00\x00\x00\x00" and data[4:6] in (b"II", b"MM") else data
+        try:
+            exif = Image.Exif()
+            exif.load(b"Exif\x00\x00" + tiff)
+            if exif.get(_ORIENTATION_TAG, 1) not in (None, 1):
+                del exif[_ORIENTATION_TAG]
+                stripped = exif.tobytes()
+                while stripped.startswith(b"Exif\x00\x00"):
+                    stripped = stripped[6:]
+                if stripped[:4] in (b"II*\x00", b"MM\x00*"):
+                    data = b"\x00\x00\x00\x00" + stripped
+        except Exception:
+            pass
+    return data
+
+
 def encode_file(
         input_source: InputType,
         cq: int = 20,
@@ -248,6 +294,7 @@ def encode_file(
                 pass
 
     # Convert any input to a numpy array
+    exif_orientation_applied = False
     if isinstance(input_source, np.ndarray):
         img_array = input_source
     else:
@@ -265,6 +312,7 @@ def encode_file(
         try:
             img = _ensure_srgb(img)
             img = ImageOps.exif_transpose(img)
+            exif_orientation_applied = True
 
             if img.mode == 'P':
                 img = img.convert('RGBA' if 'transparency' in img.info else 'RGB')
@@ -335,6 +383,10 @@ def encode_file(
     else:
         clamped_q = max(0.0, min(100.0, float(target_quality)))
         target_ssim = 1.0 - 0.5 * ((100.0 - clamped_q) / 100.0) ** 2
+
+    # AVIF wants a raw Exif item payload, not the JPEG/WebP-framed bytes callers
+    # pass (e.g. img.info["exif"], or Exif.tobytes() from the Pillow plugin).
+    exif = _normalize_exif_payload(exif, drop_orientation=exif_orientation_applied)
 
     # Call Rust function; the binding returns (bitstream, effective color CQ)
     data, chosen_cq = encode_avif(
