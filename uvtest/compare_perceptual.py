@@ -9,8 +9,8 @@ quality_metrics.py:
   1% of pixels — this catches 4:2:0 chroma fringing that LUMA-only SSIM is
   blind to, which is exactly where WebP loses to AVIF on hard-edged content.
   Rule of thumb: dE < 1 invisible, 1-2 visible on close inspection, > 3 obvious.
-- PSNR on the chroma channels (Cb/Cr), the complement of the luma PSNR the
-  other scripts already report.
+- PSNR on the chroma channels (Cb/Cr) via the standard BT.709 RGB->YCbCr
+  matrix, the complement of the luma PSNR the other scripts already report.
 
 Usage: uv run python uvtest/compare_perceptual.py --src test_imgs --limit 5
 Re-encodes each truly-transparent image with the same routes as compress_dir
@@ -37,9 +37,17 @@ from PIL import Image
 Image.MAX_IMAGE_PIXELS = None
 
 import nvavif_py as nv  # noqa: E402
-from quality_metrics import alpha_mae  # noqa: E402
+from quality_metrics import alpha_mae, alpha_mae_worst1  # noqa: E402
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+
+# RGB -> YCbCr, BT.709 (studio-swing-normalized, zero-centered: the +0.5
+# offsets cancel in PSNR). Rows are Y, Cb, Cr.
+_BT709_YCBCR = np.array([
+    [0.2126, 0.7152, 0.0722],
+    [-0.2126 / 1.8556, -0.7152 / 1.8556, 0.5],
+    [0.5, -0.7152 / 1.5748, -0.0722 / 1.5748],
+])
 
 # CIEDE2000 for the worst-1% mean. Vectorized implementation of the Sharma et
 # al. (2005) formulation; inputs are sRGB uint8 images of identical size.
@@ -103,16 +111,14 @@ def delta_e2000_worst1(ref_rgb: np.ndarray, test_rgb: np.ndarray) -> float:
 
 
 def chroma_psnr(ref_rgb: np.ndarray, test_rgb: np.ndarray) -> float:
+    """PSNR over the Cb/Cr planes, RGB -> YCbCr with the standard BT.709 matrix
+    (the library's default color matrix; scale both planes to 0-1)."""
     ref = ref_rgb.astype(np.float64) / 255.0
     test = test_rgb.astype(np.float64) / 255.0
-    m = np.array([[0.4124564, 0.3575761, 0.1804375],
-                  [0.2126729, 0.7151522, 0.0721750],
-                  [0.0193339, 0.1191920, 0.9503041]])
-    ycbcr_ref = ref @ m.T  # proxy chroma via XYZ b-vector (blue-yellow axis)
-    ycbcr_test = test @ m.T
-    cb_r, cb_t = ycbcr_ref[..., 2], ycbcr_test[..., 2]
-    cr_r, cr_t = ycbcr_ref[..., 0] - ycbcr_ref[..., 1], ycbcr_test[..., 0] - ycbcr_test[..., 1]
-    mse = (np.mean((cb_r - cb_t) ** 2) + np.mean((cr_r - cr_t) ** 2)) / 2
+    ycbcr_ref = ref @ _BT709_YCBCR.T
+    ycbcr_test = test @ _BT709_YCBCR.T
+    mse = (np.mean((ycbcr_ref[..., 1] - ycbcr_test[..., 1]) ** 2)
+           + np.mean((ycbcr_ref[..., 2] - ycbcr_test[..., 2]) ** 2)) / 2
     return float("inf") if mse == 0 else 10 * np.log10(1.0 / mse)
 
 
@@ -186,10 +192,11 @@ def main() -> None:
                 "de2000_worst1": round(delta_e2000_worst1(ref_np, test_np), 3),
                 "chroma_psnr": round(chroma_psnr(ref_np, test_np), 2),
                 "alpha_mae": round(alpha_mae(ref_a, test_a), 3),
+                "alpha_mae_worst1": round(alpha_mae_worst1(ref_a, test_a), 3),
             }
             print(f"{path.name[:30]:32} {label:5}: {r['bytes']/1e6:6.2f}MB  LPIPS {row[label]['lpips']:7.4f}  "
                   f"dE2000(1%) {row[label]['de2000_worst1']:6.2f}  chromaPSNR {row[label]['chroma_psnr']:6.2f} dB  "
-                  f"aMAE {row[label]['alpha_mae']:.2f}", flush=True)
+                  f"aMAE {row[label]['alpha_mae']:.2f} (worst1% {row[label]['alpha_mae_worst1']:.2f})", flush=True)
         wp.unlink()
         rows.append(row)
 

@@ -4,8 +4,12 @@ all-WebP pipeline) against the same source folder.
 For every source image that both runs encoded (kept_source rows are skipped —
 their output files do not exist) this reports output bytes and the shared
 quality metrics: 8x8 block luma SSIM on a 4x box-downscaled plane (same
-metric family as the rest of uvtest, see OPTIMIZATION_PROPOSALS metric note)
-and alpha MAE at full resolution for RGBA sources.
+metric family as the rest of uvtest, see OPTIMIZATION_PROPOSALS metric note;
+RGBA sources are composited over white first), plus the worst single tile and
+its source-pixel location — a localized artifact averages away in the mean,
+the location is what makes a regression report actionable. Alpha planes (RGBA
+sources) get MAE at full resolution and a worst-1% MAE: thin-edge alpha errors
+are exactly what the plane mean hides.
 
 A perceptual subset (sources small enough for CPU LPIPS) additionally gets
 composited-over-white LPIPS + dE2000 worst-1% — RGBA metrics must composite:
@@ -34,10 +38,15 @@ from PIL import Image  # noqa: E402
 Image.MAX_IMAGE_PIXELS = None
 
 import nvavif_py as nv  # noqa: E402
-from quality_metrics import alpha_mae, luma_box, ssim_blocks  # noqa: E402
+from compare_perceptual import over_white  # noqa: E402
+from quality_metrics import alpha_mae, alpha_mae_worst1, luma_box, ssim_block_stats  # noqa: E402
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".gif"}
 OUT_EXTS = ("avif", "webp", "png")
+
+# Luma planes are box-downscaled before the block SSIM (100 MP sources stay
+# cheap); worst-tile coordinates are reported back in source pixels.
+SSIM_DOWNSCALE = 4
 
 
 def load_run_formats(run_dir: Path) -> dict[str, str]:
@@ -101,6 +110,19 @@ def maybe_downscale(ref: Image.Image, test: Image.Image, max_mp: float) -> tuple
     return ref.resize(size, Image.BOX), test.resize(size, Image.BOX)
 
 
+def luma_of(img: Image.Image, has_alpha: bool, factor: int = SSIM_DOWNSCALE) -> np.ndarray:
+    """Luma plane for the block SSIM, RGBA composited over white first.
+
+    The RGB under transparent pixels is not a defined quantity — VP8/AV1 store
+    whatever the encoder produced there — so leaving it in makes the metric
+    measure invisible garbage: measured on the 12 MP transparent set, the
+    worst tiles were fully-transparent regions scoring SSIM -0.26, dragging a
+    source-vs-output mean of 0.9997 down to 0.8844.
+    """
+    rgb = Image.fromarray(over_white(np.asarray(img))) if has_alpha else img.convert("RGB")
+    return luma_box(rgb, factor=factor)
+
+
 def _compare_one(job: dict) -> dict:
     """Pool worker: SSIM + alpha MAE for one source against both runs' outputs."""
     path, pa, pb = Path(job["path"]), Path(job["pa"]), Path(job["pb"])
@@ -115,15 +137,22 @@ def _compare_one(job: dict) -> dict:
         img = load_rgba(out_path) if has_alpha else load_rgb(out_path)
         ref_img = ref_rgba if has_alpha else load_rgb(path)
         ref_img, img = crop_pair(ref_img, img)
+        ref_l = luma_of(ref_img, has_alpha)
+        out_l = luma_of(img, has_alpha)
         t0 = time.perf_counter()
+        ssim_mean, ssim_min, wx, wy = ssim_block_stats(ref_l, out_l)
         entry = {
             "bytes": out_path.stat().st_size,
-            "ssim": round(ssim_blocks(luma_box(ref_img.convert("RGB"), factor=4), luma_box(img.convert("RGB"), factor=4)), 4),
+            "ssim": round(ssim_mean, 4),
+            "ssim_min_block": round(ssim_min, 4),
+            "ssim_min_xy": [wx * SSIM_DOWNSCALE, wy * SSIM_DOWNSCALE],
         }
         ssim_s += time.perf_counter() - t0
         if has_alpha:
             ref_a = np.asarray(ref_img.getchannel("A"), dtype=np.int16)
-            entry["alpha_mae"] = round(alpha_mae(ref_a, np.asarray(img.getchannel("A"), dtype=np.int16)), 3)
+            test_a = np.asarray(img.getchannel("A"), dtype=np.int16)
+            entry["alpha_mae"] = round(alpha_mae(ref_a, test_a), 3)
+            entry["alpha_mae_worst1"] = round(alpha_mae_worst1(ref_a, test_a), 3)
         row[label] = entry
     row["ssim_s"] = round(ssim_s, 3)
     return row
@@ -175,7 +204,8 @@ def main() -> None:
     rows.sort(key=lambda r: r["name"])
     for row in rows:
         a, b = row[args.label_a], row[args.label_b]
-        extra = f"  aMAE {a.get('alpha_mae', '-'):>5} / {b.get('alpha_mae', '-'):>5}" if "alpha_mae" in a else ""
+        extra = (f"  aMAE {a.get('alpha_mae', '-')}/1%{a.get('alpha_mae_worst1', '-')}"
+                 f" | {b.get('alpha_mae', '-')}/1%{b.get('alpha_mae_worst1', '-')}") if "alpha_mae" in a else ""
         print(
             f"{row['name'][:28]:30} {row['mp']:7.2f}MP  {args.label_a}: {a['bytes']/1e6:6.2f}MB s{a['ssim']:.4f} | "
             f"{args.label_b}: {b['bytes']/1e6:6.2f}MB s{b['ssim']:.4f}{extra}",
@@ -227,7 +257,10 @@ def main() -> None:
     print(f"SSIM  : {args.label_a} mean {sa:.4f} | {args.label_b} mean {sb:.4f}")
     worst = sorted(rows, key=lambda r: min(r[args.label_a]["ssim"], r[args.label_b]["ssim"]))[:5]
     for r in worst:
-        print(f"  worst: {r['name'][:28]:30} {args.label_a} {r[args.label_a]['ssim']:.4f} | {args.label_b} {r[args.label_b]['ssim']:.4f}")
+        a, b = r[args.label_a], r[args.label_b]
+        print(f"  worst: {r['name'][:28]:30} {args.label_a} {a['ssim']:.4f} (blk {a['ssim_min_block']:.3f}"
+              f" @ {a['ssim_min_xy'][0]},{a['ssim_min_xy'][1]}) | {args.label_b} {b['ssim']:.4f}"
+              f" (blk {b['ssim_min_block']:.3f} @ {b['ssim_min_xy'][0]},{b['ssim_min_xy'][1]})")
     lp = de = 0.0
     if subset:
         keys = [("lpips", ".4f")] + ([("de2000_worst1", ".2f")] if args.de2000 else [])

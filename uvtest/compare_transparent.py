@@ -6,10 +6,14 @@ detected from the Pillow header + a full alpha scan):
   B. AVIF cq=<cq> — GPU color + CPU rav1e alpha dual-stream (transparent AVIF)
 
 Reports size, encode time, alpha fidelity (MAE, 0 = lossless) and color
-fidelity (8x8 block SSIM on 2x box-downscaled luma). Measured 2026-09-06 on
-the hard-edged transparent test set: WebP wins size/speed/alpha-losslessness,
-AVIF wins color SSIM by a structural margin (VP8 4:2:0 + block artifacts);
-see OPTIMIZATION_PROPOSALS I4.
+fidelity (8x8 block SSIM on 2x box-downscaled luma). RGBA is composited over
+white before the SSIM: the RGB under transparent pixels is unspecified (codecs
+rewrite it freely), so the un-composited口径 scored invisible content and
+understated WebP. Measured 2026-09-06, SSIM口径 fixed 2026-10-14: WebP wins
+size/speed/alpha-losslessness, and once transparent pixels are composited the
+color SSIM gap collapses (WebP ~0.997~0.9996 vs AVIF ~0.998~0.9997 — a tie),
+so AVIF's earlier apparent edge was invisible-pixel retention, not visible
+fidelity. See OPTIMIZATION_PROPOSALS I4.
 
 Usage: uv run python uvtest/compare_transparent.py [--webp-quality 90] [--limit 10]
 """
@@ -22,6 +26,8 @@ import os
 import time
 from pathlib import Path
 
+import numpy as np
+
 ROOT = Path(__file__).resolve().parent.parent
 for _dll_dir in (ROOT / "ffmpeg-out" / "bin", ROOT / "msys64" / "mingw64" / "bin"):
     if _dll_dir.is_dir():
@@ -30,9 +36,15 @@ for _dll_dir in (ROOT / "ffmpeg-out" / "bin", ROOT / "msys64" / "mingw64" / "bin
 from PIL import Image  # noqa: E402
 
 import nvavif_py as nv  # noqa: E402
+from compare_perceptual import over_white  # noqa: E402
 from quality_metrics import alpha_mae, alpha_plane, luma_box, ssim_blocks  # noqa: E402
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+
+
+def _luma_white(img: Image.Image, factor: int) -> np.ndarray:
+    """Luma plane for SSIM with RGBA composited over white first (see docstring)."""
+    return luma_box(Image.fromarray(over_white(np.asarray(img))), factor=factor)
 
 
 def is_truly_transparent(path: Path) -> bool:
@@ -72,7 +84,7 @@ def main() -> None:
         with Image.open(path) as im:
             rgba = im.convert("RGBA")
             ref_a = alpha_plane(rgba)
-            ref_l = luma_box(rgba, factor=2)
+            ref_l = _luma_white(rgba, 2)
 
         t0 = time.perf_counter()
         webp_path = out_dir / f"_cmp_{path.stem}.webp"
@@ -84,7 +96,7 @@ def main() -> None:
             "bytes": webp_path.stat().st_size,
             "encode_s": round(t_webp, 2),
             "alpha_mae": alpha_mae(ref_a, alpha_plane(wimg)),
-            "ssim": round(ssim_blocks(ref_l, luma_box(wimg, factor=2)), 4),
+            "ssim": round(ssim_blocks(ref_l, _luma_white(wimg, 2)), 4),
         }
         webp_path.unlink()
 
@@ -99,7 +111,7 @@ def main() -> None:
             "bytes": len(avif_bytes),
             "encode_s": round(t_avif, 2),
             "alpha_mae": alpha_mae(ref_a, alpha_plane(decoded)),
-            "ssim": round(ssim_blocks(ref_l, luma_box(decoded, factor=2)), 4),
+            "ssim": round(ssim_blocks(ref_l, _luma_white(decoded, 2)), 4),
         }
 
         rows.append({"name": path.name, "webp": webp, "avif": avif})

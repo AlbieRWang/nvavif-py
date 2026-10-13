@@ -7,6 +7,11 @@ with a small SSIM cost (OPTIMIZATION_PROPOSALS I4). This script re-runs that
 comparison on any folder: for every image with a side in (8192, 16383] it
 encodes both routes and reports size, encode time and color fidelity.
 
+Unlike compare_transparent.py it does NOT composite over white: both sides are
+flattened to RGB, which is self-consistent for this opaque/JPEG corpus but
+would mis-read an alpha source (it would score invisible-pixel fidelity, not
+the over-white result).
+
 Usage: uv run python uvtest/compare_oversize.py [--webp-quality 80] [--limit 4]
 """
 
