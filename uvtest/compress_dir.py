@@ -63,10 +63,15 @@ copied into the output folder by default (--copy-skipped) so the output count
 matches the input; --in-place replaces sources in their own folder instead.
 
 Metadata: EXIF orientation is physically applied to the pixels, and the
-remaining EXIF plus the ICC profile are embedded in WebP/PNG outputs
-(wide-gamut sources keep their profile). The AVIF route instead converts
-non-sRGB pixels to sRGB (avif-serialize cannot embed a profile) and does not
-pass raw EXIF bytes.
+remaining EXIF plus the ICC profile and XMP are embedded in WebP/PNG outputs
+(wide-gamut sources keep their profile). The AVIF route embeds the source EXIF
+too (minus the Orientation tag, which the encoder already applied), but cannot
+carry ICC or XMP — avif-serialize has no slot for either and those pixels are
+converted to sRGB; such images get a `dropped_meta` list in the report so the
+gap is visible rather than silent. Compressed outputs also inherit the source's
+modification and creation times (Windows) so date-sorted libraries keep their
+ordering; access time is written too but lands on the encode time, since
+reading the source already refreshes it.
 
 The scan is recursive by default and the output mirrors the source's relative
 folder structure. GIF and animated WebP sources are skipped untouched (a
@@ -128,6 +133,9 @@ NVENC_MIN_HEIGHT = 66
 
 # WebP format limit (Pillow raises above this).
 WEBP_MAX_DIMENSION = 16383
+
+# EXIF tag id for Orientation (ExifTags.Base.Orientation).
+_ORIENTATION_TAG = 0x0112
 
 # IJG standard luminance quantization table (the baseline every mainstream
 # JPEG encoder scales to express its quality setting).
@@ -222,9 +230,106 @@ def probe_cost(path: Path) -> dict:
     }
 
 
+# Source metadata the AVIF container cannot carry: avif-serialize 0.8.8 only
+# exposes set_exif, so ICC and XMP have nowhere to go (the pixels are converted
+# to sRGB instead). Listed per image in the report's `dropped_meta`.
+_AVIF_UNSUPPORTED_META = ("icc_profile", "xmp")
+
+
+def _source_exif_bytes(path: Path) -> tuple[bytes | None, list[str]]:
+    """AVIF-conformant EXIF payload for `path`, plus what the container cannot hold.
+
+    Returns ``(payload, dropped)``; `dropped` lists the tracked source metadata
+    that will not reach the output — the `_AVIF_UNSUPPORTED_META` keys present
+    in the source, or ``"exif"`` when the bytes could not be parsed. It is
+    recorded in the report so a metadata-free source and a bare-metal container
+    are not confused.
+
+    The AVIF route used to drop EXIF entirely (PARITY_MATRIX M5). Handing the
+    bytes over is not enough — the HEIF Exif item has its own layout:
+    - drop the Orientation tag: encode_file applies it to the pixels itself, and
+      a leftover tag would make viewers rotate the output a second time;
+    - strip the JPEG/WebP "Exif\\0\\0" marker and prepend the 4-byte TIFF-header
+      offset the item requires. Neither (nor the raw Pillow bytes, which have
+      the marker and no offset) is accepted: libavif rejects the whole file with
+      "Invalid Exif payload" — Pillow cannot even open it.
+    """
+    dropped: list[str] = []
+    try:
+        with Image.open(path) as im:
+            for key in _AVIF_UNSUPPORTED_META:
+                if im.info.get(key):
+                    dropped.append(key)
+            raw = im.info.get("exif")
+            if not isinstance(raw, (bytes, bytearray)) or not raw:
+                return None, dropped
+            exif = im.getexif()
+    except Exception:
+        return None, dropped
+    data = bytes(raw)
+    if exif.get(_ORIENTATION_TAG, 1) not in (None, 1):
+        del exif[_ORIENTATION_TAG]
+        data = exif.tobytes()
+    while data.startswith(b"Exif\x00\x00"):
+        data = data[6:]  # JPEG/WebP marker; Exif.tobytes() emits it again
+    if data[:4] not in (b"II*\x00", b"MM\x00*"):
+        dropped.append("exif")  # unknown layout: no EXIF beats an unopenable file
+        return None, dropped
+    return b"\x00\x00\x00\x00" + data, dropped
+
+
+if os.name == "nt":
+    import ctypes
+    from ctypes import wintypes
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel32.CreateFileW.restype = wintypes.HANDLE
+    _kernel32.CreateFileW.argtypes = (
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    )
+    _kernel32.SetFileTime.argtypes = (
+        wintypes.HANDLE, ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME),
+    )
+    _kernel32.SetFileTime.restype = wintypes.BOOL
+    _kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+
+    def _set_creation_time(path: Path, timestamp: float) -> None:
+        # os.utime only covers access/modification; Explorer's 创建时间 needs
+        # SetFileTime on a handle opened with FILE_WRITE_ATTRIBUTES.
+        handle = _kernel32.CreateFileW(
+            str(path), 0x0100, 0, None, 3, 0, None  # FILE_WRITE_ATTRIBUTES, OPEN_EXISTING
+        )
+        if not handle or handle == ctypes.c_void_p(-1).value:
+            return
+        try:
+            ticks = int((timestamp + 11644473600) * 10_000_000)  # unix -> FILETIME epochs
+            ft = wintypes.FILETIME(ticks & 0xFFFFFFFF, ticks >> 32)
+            _kernel32.SetFileTime(handle, ctypes.byref(ft), None, None)
+        finally:
+            _kernel32.CloseHandle(handle)
+
+
+def _copy_file_times(dst: Path, src_stat: os.stat_result) -> None:
+    """Give the compressed output the source's file times.
+
+    A re-encoded image is a brand-new file, so without this the original dates
+    are lost from every compressed image — which is what photo libraries sort
+    by. Copies of unencoded sources already go through shutil.copy2, which
+    preserves them; this covers the encoded ones.
+    """
+    try:
+        os.utime(dst, (src_stat.st_atime, src_stat.st_mtime))
+        if os.name == "nt":
+            _set_creation_time(dst, src_stat.st_ctime)
+    except OSError:
+        pass
+
+
 def _encode_task(task: dict) -> dict:
     """Pool worker: encode one image, return a per-image report row."""
-    from PIL import Image
+    from PIL import Image, PngImagePlugin
 
     path = Path(task["path"])
     in_place = task["in_place"]
@@ -233,7 +338,9 @@ def _encode_task(task: dict) -> dict:
     t0 = time.perf_counter()
     # Capture BEFORE any in-place overwrite — after writing, stat() would
     # return the new (compressed) file's size and break the keep-smaller guard.
-    src_bytes = path.stat().st_size
+    # The full stat is kept for the output's timestamp copy.
+    src_stat = path.stat()
+    src_bytes = src_stat.st_size
 
     # Whole-image WebP routing covers two cases: (a) transparent images when
     # --transparent-format is webp/png (WebP codes alpha losslessly and keeps
@@ -307,6 +414,7 @@ def _encode_task(task: dict) -> dict:
         with Image.open(path) as im:
             src_exif = im.info.get("exif")
             src_icc = im.info.get("icc_profile")
+            src_xmp = im.info.get("xmp")
             # Only the transparent route needs the alpha plane; on the
             # oversize/opaque routes an all-opaque alpha channel costs WebP
             # bytes and encode time for nothing (REVIEW_FINDINGS B8).
@@ -331,16 +439,23 @@ def _encode_task(task: dict) -> dict:
                 enc_img = enc_img.resize((width, height), Image.LANCZOS)
         elif need_resize:
             enc_img = enc_img.resize((width, height), Image.LANCZOS)
-        # WebP/PNG containers carry ICC and EXIF natively, so embed both
-        # as-is — wide-gamut sources keep their profile instead of being
+        # WebP/PNG containers carry ICC, EXIF and XMP natively, so embed all
+        # three as-is — wide-gamut sources keep their profile instead of being
         # silently reinterpreted as sRGB. (The AVIF route converts pixels to
-        # sRGB instead because avif-serialize cannot embed a profile, and
-        # does not pass raw EXIF bytes today.)
+        # sRGB and keeps only EXIF: avif-serialize has no ICC/XMP slot.)
         save_meta = {}
         if src_exif:
             save_meta["exif"] = src_exif
         if src_icc:
             save_meta["icc_profile"] = src_icc
+        if src_xmp:
+            if whole_format == "webp":
+                save_meta["xmp"] = src_xmp
+            else:
+                # PNG has no xmp= keyword: XMP travels as the Adobe iTXt chunk.
+                pnginfo = PngImagePlugin.PngInfo()
+                pnginfo.add_itxt("XML:com.adobe.xmp", src_xmp)
+                save_meta["pnginfo"] = pnginfo
         if in_place:
             # Write-then-replace via a temp file: a .png/.webp source can
             # share its name with the output, and a failed encode must
@@ -386,6 +501,7 @@ def _encode_task(task: dict) -> dict:
                         "encode_s": round(time.perf_counter() - t0, 3),
                     },
                 }
+        _copy_file_times(out_path, src_stat)
         elapsed = time.perf_counter() - t0
         return {
             "ok": True,
@@ -414,6 +530,9 @@ def _encode_task(task: dict) -> dict:
         kwargs.update(auto_cq=True, target_quality=task["auto_quality"])
     else:
         kwargs["cq"] = task["cq"]
+    src_exif, dropped_meta = _source_exif_bytes(path)
+    if src_exif:
+        kwargs["exif"] = src_exif
     data, chosen_cq = nv.encode_file(path, with_cq=True, **kwargs)
     elapsed = time.perf_counter() - t0
 
@@ -436,6 +555,7 @@ def _encode_task(task: dict) -> dict:
                 },
         }
     out_path.write_bytes(data)
+    _copy_file_times(out_path, src_stat)
 
     with Image.open(path) as im:
         width, height, mode = im.width, im.height, im.mode
@@ -459,6 +579,9 @@ def _encode_task(task: dict) -> dict:
             "bits_per_pixel": round(len(data) * 8 / max(width * height, 1), 3),
             "encode_s": round(elapsed, 3),
             "mp_per_s": round(width * height / 1e6 / max(elapsed, 1e-6), 2),
+            # ICC/XMP the AVIF container cannot hold; the source channel is the
+            # only copy left, so flag it instead of letting it vanish silently.
+            **({"dropped_meta": dropped_meta} if dropped_meta else {}),
         },
     }
 
