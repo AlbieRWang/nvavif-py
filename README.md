@@ -601,7 +601,7 @@ with open("photo_with_exif.avif", "wb") as f:
     f.write(avif_data)
 ```
 
-> `encode_file()` also extracts EXIF from PIL Images automatically if they carry it in `img.info["exif"]` — no manual extraction needed in most cases.
+> `encode_file()` embeds exactly the blob you pass (it does **not** read `img.info` on its own) — the Pillow plugin is what auto-extracts: `img.save("photo.avif", "AVIF")` picks up `img.info["exif"]` for you. In both paths the blob is normalized: the JPEG/WebP form (`b"Exif\x00\x00" + TIFF`) is rewritten to the HEIF Exif item layout (4-byte TIFF offset + TIFF), the Orientation tag is dropped (the pixels were already straightened by `exif_transpose`), and an unrecognized blob is discarded rather than embedded — a malformed payload would make the whole AVIF unopenable (`Invalid Exif payload`).
 
 ### Pillow Plugin — Save Directly
 

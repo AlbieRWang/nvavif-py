@@ -38,11 +38,12 @@
 | M2 | 转正导致宽高交换 | 报表 `width/height/megapixels` 为**编码后**尺寸；`resized_from` 为转正后、缩放前的尺寸 |
 | M3 | 源带 ICC profile，走 WebP/PNG 路由 | ICC 原样嵌入输出（不转像素、不丢配置）；无损 WebP 像素逐字节不变 |
 | M4 | 源带 ICC profile，走 AVIF 路由 | 像素先转换到 sRGB（`_ensure_srgb`/ImageCms 语义）；avif-serialize 不能嵌 profile（当前上游能力边界） |
-| M5 | AVIF 路由的原始 EXIF 字节 | **不透传**（现产品决策：丢弃；如改为主流程决策点，改此行并同步 Python 版） |
+| M5 | AVIF 路由的原始 EXIF 字节 | **透传**（2026-10-14 起）：Exif item payload = 4 字节大端 TIFF 头偏移 + TIFF（剥掉 JPEG/WebP 的 `Exif\0\0` 前缀）；像素已物理转正，故移除 Orientation 标记；布局无法识别则整块丢弃（libavif 遇畸形 item 会以 "Invalid Exif payload" 拒绝**整个文件**，宁可无 EXIF） |
 | M6 | 奇数宽/高（AVIF 路由） | 按 NVENC 偶数约束裁 1px |
 | M7 | Pillow 解码炸弹保护 | 关闭（超大摄影图为合法输入） |
 | M8 | 调色板/L/IA/LA/F 等模式的输入 | 按参考实现的模式转换矩阵归一到 RGB/RGBA（见 encode_file wrapper） |
 | M9 | auto_cq 逐图标定结果留档 | AVIF 行记录 `cq` = 实际使用的颜色面 CQ（auto 时为标定值，固定 CQ 时等于请求值；`encode_file(with_cq=True)` 获取） |
+| M10 | 各路由的元数据承载 | WebP/PNG：EXIF + ICC + XMP 原样嵌入（宽色域保 profile）。AVIF：仅 EXIF（去 Orientation）；**ICC/XMP 容器装不下**（avif-serialize 只暴露 `set_exif`，且像素已转 sRGB），缺失项逐图记入 report 行的 `dropped_meta`（无缺失则省略） |
 
 ## 3. 文件系统行为（F 系列）
 
@@ -56,6 +57,7 @@
 | F6 | in-place + AVIF 路由成功 | 输出后缀 `.avif` 不与任何源后缀相同，直接删源 |
 | F7 | `--copy-skipped`(默认 on，in-place 下无效) | kept_source/跳过 JPEG/动图/**编码失败**的源全部原样拷入输出；失败源拷入**源对应的镜像子目录**（不得平铺到输出根） |
 | F8 | 汇总/自拷贝路径 | summary 与 copy-skipped 的输出计数在 in-place 下保持一致 |
+| F9 | 编码输出的文件时间 | 输出**修改时间** = 源 mtime（`os.utime`）；Windows 上**创建时间**另需 `SetFileTime`（源 `st_ctime`）。源 stat 在写盘前捕获、in-place 时早于删源；WebP/PNG/AVIF 各路由一致。（atime 亦随 `os.utime` 写入，但源在编码前已被读取，其 atime 已刷新为编码时刻，故输出 atime ≈ 编码时刻，非源原始 atime） |
 
 ## 4. 并行与调度（P 系列）
 
@@ -106,4 +108,4 @@ color-rav1e-threads, overwrite, report, config, write-config
 
 - 动图（GIF/动图 WebP）不支持，跳过并计数。
 - YUV444 输入在本机 AV1 NVENC 不可用（必然 CPU 回退），批量管线默认 420 不受影响。
-- 评测指标简化口径见 OPTIMIZATION_PROPOSALS 文首度量说明（chroma PSNR/ΔE2000 的简化实现）。
+- 评测指标口径见 OPTIMIZATION_PROPOSALS 文首度量说明（chroma PSNR 为标准 BT.709 矩阵；ΔE2000 的 hue-mean 为简化实现）。

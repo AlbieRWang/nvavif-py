@@ -29,13 +29,18 @@ the command conventions and the `out/_t_*` scratch-directory rule.
 ## Quality / comparison tooling
 
 - `quality_metrics.py` — SSIM/MAE helpers shared by the compare scripts.
-- `compare_perceptual.py` — SSIM + LPIPS + simplified chroma metrics between
+- `compare_perceptual.py` — SSIM + LPIPS + chroma metrics between
   two runs (see `../OPTIMIZATION_PROPOSALS.md` measurement caveats: SSIM is
-  blind to 4:2:0 chroma bleed; chroma PSNR/ΔE are simplified implementations).
+  blind to 4:2:0 chroma bleed; chroma PSNR uses the standard BT.709 matrix,
+  ΔE2000's hue-mean remains simplified).
 - `compare_runs.py` — pairs two batch runs by report rows (never by filename —
   stale outputs poisoned an early comparison, hence the report-keyed pairing).
+  RGBA sources are composited over white before the block SSIM; each image
+  also reports its worst tile and that tile's source-pixel location.
 - `compare_transparent.py` / `compare_oversize.py` — focused route comparisons
-  (WebP vs AVIF for transparent / oversized sources).
+  (WebP vs AVIF for transparent / oversized sources). `compare_transparent`
+  composites RGBA over white before the SSIM; `compare_oversize` flattens both
+  sides to RGB instead (self-consistent for its opaque corpus, not composited).
 - `bench_alpha_tuning.py` — rav1e alpha speed/quality sweep
   (`ALPHA_RAV1E_PRESET`).
 - `test_oversize_preset.py` — validates the oversize CPU-fallback preset

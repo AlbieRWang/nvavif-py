@@ -378,10 +378,10 @@ avif-serialize 不能嵌 ICC、rav1e asm bug 等)**不在此重复立项**,见�
 - alpha 只能 rav1e CPU、`asm` feature 静默损坏 alpha 及其回归测试(§3.2/§11.4);
   恢复 asm 的前置条件(NASM 换源 + 重跑回归)未满足。
 - YUV444 显式 GPU 路径取决于运行时 capability,本机必回落(§14)。
-- avif-serialize 不能嵌 ICC、AVIF 路由不透传原始 EXIF(PARITY_MATRIX M4/M5)。
+- avif-serialize 不能嵌 ICC（PARITY_MATRIX M4）；AVIF 路由**已**透传原始 EXIF（M5，2026-10-14 起，含 JPG/WebP 载荷归一化为 HEIF Exif item 布局）。
 - NVENC 会话上限 8、ctx 打开 ~80ms、LRU 先驱逐再开(§16;lib.rs 已实现)。
-- 提案池状态:已落地 H/I1/I3'(显式版)/I4/J/K/Q/D/P(实测未改默认);
-  暂停/条件触发 A/B/E/G/I2/M/N/O/R;否决 C/F/L(见 OPTIMIZATION_PROPOSALS §5)。
+- 提案池状态:已落地 H/I1/I3'(显式版)/I4/J/K/Q/D/P(实测未改默认)/O(2026-10-14);
+  暂停/条件触发 A/B/E/G/I2/M/N/R;否决 C/F/L(见 OPTIMIZATION_PROPOSALS §5)。
 - 文档待办两条:多次重复取中位数收窄 ±25% 噪声;向 rav1e 上游提交 11.4 复现用例。
 
 ---

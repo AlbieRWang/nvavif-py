@@ -711,15 +711,73 @@ WIC 注意事项：WPF `CopyPixels` 查询对 alpha HEIC 一律返回 `Bgr32` �
 |---|---|---|---|
 | 编码闭环（每图自动） | 8×8 块状 SSIM（仅亮度） | `src/lib.rs` `calculate_ssim` | auto_cq 校准到 target 0.88；试编码固定 512×512 |
 | 感知评估（人工跑） | LPIPS（alex, torch）；ΔE2000 worst-1% 仅色度专项辅助 | `uvtest/compare_perceptual.py`、`compare_runs.py` | 最终裁判 = LPIPS + 人工核验 |
-| 回归报警（自动） | SSIM / PSNR / alpha MAE | `uvtest/quality_metrics.py`、`cargo test` | 同路径回归比较，不做观感预测 |
+| 回归报警（自动） | SSIM（含最差块数值/坐标）/ PSNR / alpha MAE（含 worst-1%） | `uvtest/quality_metrics.py`、`cargo test` | 同路径回归比较，不做观感预测 |
 
 要点（完整方法论见 OPTIMIZATION_PROPOSALS.md 开头"度量方法说明"）：
 
-- 分块 SSIM 对高频/硬边缘**偏保守**（实测 SSIM 0.925 的图人工不可辨，合成白底后 LPIPS 0.003~0.005），
-  只当回归检测器，不当观感预测器；"看起来一样吗"这类问题以 LPIPS 为准（<0.05 ≈ 不可辨）。
+- 分块 SSIM 对高频/硬边缘**偏保守**，只当回归检测器，不当观感预测器；"看起来一样吗"这类问题以
+  LPIPS 为准（<0.05 ≈ 不可辨）。（此前记的"实测 SSIM 0.925 的图人工不可辨"成因已于 2026-10-14 更正：
+  那个 0.925 来自未合成白底的口径，见下条与 OPTIMIZATION_PROPOSALS 方案 P 修订。）
 - **ΔE2000 不是独立判断依据**：简化实现（hue-mean）仅作同路径内相对比较；`compare_runs.py` 默认关闭
   （最贵指标 ~3-6× LPIPS，LPIPS 已覆盖观感结论），仅在专项排查 4:2:0 色度渗色时开启。
 - RGBA 算任何指标前必须**先合成到背景色**，否则透明像素下方无意义的 RGB 会污染数值。
 - LPIPS 数值仅在同一网络（alex）、同类失真间可比；torch 为 CPU 版，`compare_runs.py` 的
-  感知子集限 ≤4MP 源。ΔE2000/色度 PSNR 为简化实现，仅限同一路径内相对比较。
+  感知子集限 ≤4MP 源。ΔE2000 的 hue-mean 为简化实现（色度 PSNR 已于 2026-10-14 换成标准 BT.709 矩阵），仅限同一路径内相对比较。
 - VMAF 未使用（视频向指标，需 libvmaf），图片场景由 LPIPS 承担该角色。
+- **指标精度升级（2026-10-14，方案 O）**：色度 PSNR 换成标准 BT.709 RGB→YCbCr 矩阵；
+  `alpha_mae_worst1()` 补上了全图均值掩盖的边缘误差（`compare_perceptual.py` / `compare_runs.py` 并列输出）；
+  分块 SSIM 经 `ssim_block_stats()` 返回最差块数值与坐标，`compare_runs.py` 的 worst-5 行打印源像素坐标。
+  mean 类数值算法未变，历史报表仍可比；仅 chroma PSNR 数值口径变化（无归档结论引用它）。
+- **合成口径修正（2026-10-14，与上条同批暴露）**：`compare_runs.py` 此前把 RGBA 直接丢 alpha 转 RGB 喂进
+  分块 SSIM，违反"RGBA 先合成背景色"这条规则本身——全透明区块的 RGB 是编码器自由写入的字节，实测最差块
+  SSIM **-0.26**、源对输出均值 0.9997 被拉到 0.8844。现改为先合成白底，全量 55 张的 AVIF/WebP 均值由
+  0.9898/0.9895 变为 **0.9972/0.9969**，最差图从透明 12MP 图变成硬边缘照片（0.991，最差块 0.97）。
+  相对结论不变，但方案 P 里"最差 5 张是真透明图、属分块 SSIM 保守性"的归因作废。
+  `compare_transparent.py` 已同批修正（透明集 WebP 颜色 SSIM 0.925~0.997 → **0.997~0.9996**，AVIF 的"结构性优势"作废，见 OPTIMIZATION_PROPOSALS I4）；`compare_oversize.py` 两侧都先展平成 RGB、口径自洽，不透明/JPEG 语料不受影响，保持不动。
+
+## 20. AVIF EXIF 透传与文件时间保持（2026-10-14）
+
+动机：`compress_dir.py` 的 AVIF 路由此前丢弃源 EXIF，输出的访问/修改/创建时间也被编码重写成"现在"。
+两条在 2026-10-14 一并补上。
+
+**EXIF（PARITY_MATRIX M5：由"不透传"改为"透传"）**
+
+- 载荷格式是硬约束：HEIF 的 Exif item 载荷 = **4 字节大端 TIFF 头偏移 + TIFF**，不是 JPEG/WebP 的
+  `b"Exif\0\0" + TIFF`。`avif-serialize` 的 `set_exif` 原样写入；libavif 遇到畸形 item 会以
+  **"Invalid Exif payload" 拒绝整个文件**（Pillow 连打开都失败），所以宁可丢弃，也不能塞错。
+- 两处实现：
+  - `uvtest/compress_dir.py::_source_exif_bytes(path)`：读源 EXIF（只读头），去掉 Orientation（像素已物理
+    转正），剥掉 `Exif\0\0` 前缀，补齐 4 字节偏移；布局无法识别则返回 None（无 EXIF 优于打不开）。
+  - `source/nvavif_py/__init__.py::_normalize_exif_payload()`：库层同一归一化，`encode_file` 在调 Rust 前调用。
+    像素经 `exif_transpose` 的输入（PIL/路径/字节）丢弃 Orientation；numpy 输入不转正，保留原标签。
+    已归一化的载荷幂等通过。
+- 实测：载荷 94B（`\x00\x00\x00\x00` + `MM\x00*`），libavif/Pillow 读回 Make/Model/DateTime，Orientation 缺席；
+  像素只转正一次；无 EXIF 源为 no-op；`_source_exif_bytes` 在 26.8MB JPEG 上 ~1.1 ms/次。
+- ⚠️ 库层修复已进**源码**，但 `.venv` 装的是**预构建 wheel**（`pyproject.toml` 明示 venv 不从源码装，
+  见第 5 节安装布局）。因此 `encode_file(exif=...)` / Pillow 插件 `img.save(..., "AVIF")` 的修复要
+  **重建 wheel 后才在 venv 生效**；修复前这两条路把 JPEG 帧原样写入，产出**打不开**的 AVIF。
+  `compress_dir.py` 自带载荷构建，不受该 wheel 状态影响。
+- ⚠️ 回读校验的坑：Pillow 的 AVIF 解码会把报出的 Orientation 归一化成 **1**（libavif 行为），
+  即便文件里原样存着 6。所以校验"编码是否保留 Orientation"必须查**文件字节**，不能信 `getexif()`。
+  （已按此复验：`encode_file(np_array, exif=<Orientation=6>)` 的输出文件里就是 `…0006`；库层逐字节原样写入。）
+
+**文件时间（PARITY_MATRIX F9，新增）**
+
+- 编码输出的 mtime 用 `os.utime` 继承源文件；Windows 上创建时间另需 `SetFileTime`
+  （`CreateFileW` 以 `FILE_WRITE_ATTRIBUTES` 打开，FILETIME = 自 1601 起的 100ns 计数，偏移 11644473600 s）。
+  源 `st_ctime` 在写盘前捕获，in-place 时也早于删源；WebP/PNG/AVIF 各路由一致。
+- atime 也一并写入，但**无实际保持意义**：本文件系统读文件即刷新 atime，而源在编码前必被读取
+  （头探测 + 编码），worker 取 `src_stat` 时源 atime 已是编码时刻——所以输出 atime ≈ 编码时刻。
+  真正被恢复的是 mtime 与创建时间（实测 atime 保持均失败、mtime/creation 保持均通过）。
+
+**元数据承载台账（PARITY_MATRIX M10，2026-10-14 同批）**
+
+- 先量后补：扫 `test_imgs` 的信息键，源普遍带 `exif / icc_profile / xmp / photoshop / adobe / dpi`。
+  - **EXIF 已不丢**：含 GPS + Exif 子 IFD 的 EXIF 过 `_source_exif_bytes` 后全部读回，仅刻意去 Orientation。
+  - WebP/PNG 路由补上 **XMP**（此前只传 EXIF+ICC）：WebP 走 `xmp=` 参数，PNG 走 Adobe iTXt 块
+    `XML:com.adobe.xmp`（`PngImagePlugin` 无 `xmp=` 关键字）。实测 WebP/PNG 输出三件套全读回。
+  - AVIF 路由装不下 ICC/XMP（avif-serialize 0.8.8 只有 `set_exif`），像素已转 sRGB——不再静默，
+    逐图在 report 行记 `dropped_meta: ["icc_profile","xmp"]`（无缺失则无此键）。
+- 未处理的仍丢：`photoshop`(IPTC)/`adobe`/`dpi` 各路由都不传；如需保留另立工作项。
+- 未做 per-image 旁路文件（污染图库目录、被递归扫描当输入、输出计数翻倍）；也未引 YAML——沿用
+  已有的 `--report`（JSON + `.stream.jsonl`）当唯一清单，位于目标根目录。
