@@ -1,260 +1,249 @@
-# nvavif_py 开发、安装与可行性验证记录
+# nvavif_py 开发、安装与运维记录
 
 ## 1. 文档信息
 
-- 记录日期：2026-08-04
-- 项目：`nvavif_py`
-- 平台：Windows x64
-- 测试 GPU：NVIDIA RTX 4070
-- NVIDIA 驱动：610.88
-- Python：`3.13`
-- Rust：`rustc 1.97.1`
-- FFmpeg：`8.1`
-- 主要 Rust 依赖：PyO3 `0.27`、`ffmpeg-next 8.1`、`avif-serialize 0.8.8`、`rav1e 0.7.1`、`dav1d`
+- 更新：2026-10-17
+- 平台：Windows x64；测试 GPU：NVIDIA RTX 4070；驱动：610.88
+- Python 3.13；Rust 1.97.1；FFmpeg 8.1
+- 主要 Rust 依赖：PyO3 0.27、ffmpeg-next 8.1、avif-serialize 0.8.8、rav1e 0.7.1、dav1d
 
-本文记录本次从 PyPI 可行性验证、源码问题定位、Windows 本地编译、运行时 DLL 排查，到最终批量功能和性能测试的完整过程。
+本文是**当前实现与运维手册**，只保留仍然成立的事实、决策及其理由。详细的历史测量过程已从正文移除，
+需要追溯时看 git 历史。配套文档的分工：
 
-**项目目的（2026-09-05 明确）**：本项目在原 nvavif_py 库基础上的使用目标是**调用 NVIDIA GPU 加速海量图片的批量压缩**——图库是混合内容，普通图和透明 PNG 都有——要求输出体积小、画质保真、RGBA 透明通道不丢失，且透明图路径不能因为 CPU alpha 编码而拖垮整体吞吐。后续所有优化决策以"压缩率、画质、alpha 正确性、编码速度"四个指标为准。
+| 文档 | 角色 |
+|---|---|
+| `PARITY_MATRIX.md` | 批处理行为的**唯一验收规格**（路由、元数据、文件系统、报表、CLI） |
+| `uvtest/README.md` | 测试/基准脚本索引与测量方法 |
+| `OPTIMIZATION_PROPOSALS.md` | 优化方案台账（已落地 / 已否决 / 条件触发） |
+| `REVIEW_FINDINGS_2026-09-13.md` | 已闭环的审查台账（A/B/C/D/E 条目与裁决理由） |
 
-## 2. 最终结论
+**项目目的（2026-09-05 明确）**：用 NVIDIA GPU 加速海量图片的批量压缩。图库是混合内容，
+普通图与透明 PNG 都有；要求输出体积小、画质保真、RGBA 透明不丢失，且透明路径不被 CPU alpha
+编码拖垮。评价指标为压缩率、画质、alpha 正确性、编码速度。
 
-当前版本对正常尺寸图片是可用的：
+---
 
-- 普通 RGB/JPEG/PNG 默认路径可以使用 NVENC GPU 编码。
-- 没有可用 NVENC 时，`device="auto"` 会切换到 rav1e CPU 编码。
-- alpha 已改为符合 AVIF 规范的独立 YUV400/monochrome AV1 辅助流。
-- `decode_file()` 已能读取辅助 alpha 流并返回 RGBA NumPy 数组。
-- Pillow 与浏览器均已验证透明 AVIF 的实际解码合成正确。注意验证范围（2026-09-05 补充实测）：Windows 看图软件对 AVIF/HEIC 的 alpha 一律不合成，透明区显示为黑色——透明 AVIF、标准 libheif alpha HEIC、双 item 全 GPU HEIC 全部如此；Photoshop 不支持这些格式。透明图的可靠查看环境是浏览器和 Pillow/libheif 生态，看图软件黑底是查看器限制，不是文件缺陷。
-- 8/10-bit、YUV420/YUV444、f32 输入、Pillow 插件、奇数尺寸等功能测试通过。
+## 2. 当前结论
 
-仍然存在的已知限制：
+- **批量入口**是 `uvtest/compress_dir.py`。默认策略见 `PARITY_MATRIX.md` §1，核心是：
+  ≤2 MP 不透明图走 WebP Q90；2–8 MP 走 AVIF CQ36；>8 MP 走 AVIF CQ30；真透明走 WebP；
+  超过 8192 走 WebP（>16383 先缩放到 16383，否则跳过并保留源）；JPEG 估计质量 <85 保留源；
+  keep-smaller / copy-skipped 默认开启。
+- **库 API 可用**：普通 RGB/JPEG/PNG 默认走 NVENC；无 NVENC 时 `device="auto"` 回落 rav1e；
+  透明 AVIF 的颜色走 GPU、alpha 走 rav1e 的独立 YUV400 流；`decode_file()` 用 dav1d 解码。
+- **8/10-bit、YUV420/YUV444、f32、Pillow 插件、奇数尺寸**均有回归覆盖；YUV444 的显式 GPU
+  路径取决于运行时 capability（本机不可用）。
+- **已知边界**：NVENC 每轴 8192、最小尺寸 130×66；WebP 上限 16383；alpha 无 GPU 编码；
+  AVIF 容器不能带 ICC/XMP；Windows 看图软件不合成 AVIF/HEIC 的 alpha。详见 §12、§14
+  和 `PARITY_MATRIX.md` §8。
+- **输出元数据**：AVIF 透传源 EXIF（去 Orientation）；WebP/PNG 透传 EXIF + ICC + XMP；
+  批量输出保持源的 mtime 与创建时间。详见 §20。
 
-- 当前 NVENC AV1 路径的实测最大宽度和高度都是 `8192`。超过任一轴时，GPU 不能编码原始尺寸。
-- 超过尺寸限制的图片目前在 `auto` 模式下会回落到 CPU，测试脚本暂时直接跳过它们。
-- alpha 的 YUV400 编码目前使用 rav1e CPU，因为当前 `av1_nvenc` 路径没有安全的 monochrome/YUV400 输入接口。2026-09-05 已把 alpha 固定为 rav1e 高速档（speed 9，与颜色 preset 解耦，见 11.4）：10 张透明测试图总耗时 93.7s → 9.8s（约 9.6×，0.65 → 6.25 MP/s），代价是文件增大 10~25%，alpha MAE 仍在 0.1~0.7/255 量级。透明图剩余瓶颈仍是 CPU alpha，但已接近可投产水平。
-- YUV444 的 GPU 路径依赖具体 FFmpeg/NVENC 运行时能力。当前本机 `auto` 模式可以在 GPU 拒绝时回落到 CPU 并成功输出；不能把当前机器上的 YUV444 视为稳定的显式 GPU 路径。
+---
 
 ## 3. 项目架构
 
 ### 3.1 编码路径
 
-Python API 由 PyO3 暴露，核心实现在 `src/lib.rs`：
+Python API 由 PyO3 暴露，核心在 `src/lib.rs`：
 
-1. `encode_file()` 读取路径、Pillow 对象、NumPy 数组或原始 bytes。
-2. Rust 侧进行 dtype、尺寸、EXIF、ICC、EXIF orientation 和奇数尺寸处理。
-3. 使用 Rayon 并行转换为 NV12/P010 或 YUV444P/YUV444P16LE。
-4. 正常颜色流优先交给 FFmpeg 的 `av1_nvenc`。
-5. NVENC 不可用或当前输入不受支持时，`auto` 切换到 rav1e。
-6. 使用 `avif-serialize` 将颜色 AV1 流、可选 alpha AV1 流、CICP 和 EXIF 封装成 AVIF。
+1. `encode_file()` 接受路径、Pillow 对象、NumPy 数组或原始 bytes。
+2. 包装层做模式归一、ICC→sRGB（恒等时跳过）、方向转正、奇数尺寸裁 1px、EXIF 归一化。
+3. Rust 侧用 rayon 并行转换为 NV12/P010 或 YUV444P/YUV444P16LE。
+4. 颜色流优先交给 FFmpeg 的 `av1_nvenc`；不可用或当前输入不支持时，`auto` 切换 rav1e。
+5. `avif-serialize` 将颜色流、可选 alpha 流、CICP 和 EXIF 封装为 AVIF。
 
 ### 3.2 alpha 路径
 
-AVIF 的 alpha 不是普通 NV12/YUV420 颜色流，而是独立的 monochrome/YUV400 AV1 item。
+AVIF alpha 是独立的 monochrome/YUV400 AV1 item，不是普通 NV12/YUV420 流：
 
-因此当前透明图片的流程是：
+- 颜色流：NVENC（GPU）。
+- alpha 流：rav1e `ChromaSampling::Cs400`（CPU），固定 speed 9。
+- 两条流并行编码；容器写入正确的 alpha 辅助流元数据。
 
-- 颜色流：NVENC GPU。
-- alpha 流：rav1e CPU，`ChromaSampling::Cs400`。
-- 两条流并行编码，避免 alpha 编码完全串行阻塞颜色编码。
-- 容器中设置正确的 alpha 辅助流元数据。
-
-使用 NV12 编码 alpha、然后只修改容器元数据是不符合格式的，虽然某些解码器可能勉强读取，但也可能把整张图片当成透明。这是之前 alpha 解码错误的根本原因。
+用 NV12 编码 alpha 再改容器元数据不符合规范：部分解码器会正确裁剪，部分会把整张图当透明。
 
 ### 3.3 解码路径
 
-`decode_file()` 使用 FFmpeg/dav1d 解码所有视频流：
+`decode_file()` 用 FFmpeg/dav1d 解码：
 
-- 第一个视频流作为颜色流，转换为 RGB。
-- 其它视频流作为候选 alpha 流。
-- 读取 alpha 流的 luma plane。
-- 将 RGB 和 alpha 合并为 `H x W x 4` 的 NumPy 数组。
-- 没有 alpha 时仍返回 `H x W x 3`。
+- 第一个视频流作为颜色流，转 RGB。
+- 其余视频流作为候选 alpha 流，读取 luma plane。
+- 合并为 `H×W×4`；无 alpha 时返回 `H×W×3`。
+- 支持 GRAY8/GRAY10（广播为 RGB）与 YUVA422P10LE；忽略 `color_range`（自家产物恒为 full-range）。
 
-## 4. 本次发现并修复的问题
+---
 
-| 问题 | 原因 | 修复 | 当前状态 |
-|---|---|---|---|
-| YUV444 GPU 编码直接失败 | 原代码把 FFmpeg `profile` 设置为字符串 `high`，而 `av1_nvenc` 的 AV1 profile 选项使用整数值 | 对 YUV444 设置 `profile="1"`，并同步正确的 chroma metadata | `auto` 可回落 CPU；显式 GPU 仍取决于当前 NVENC 能力 |
-| 解码器显示透明图全透明 | alpha item 实际编码成 NV12/YUV420，但容器标记为 monochrome/YUV400 | alpha 改用 rav1e `Cs400`，颜色与 alpha 并行编码 | Pillow、Chrome、实际 RGBA 像素均验证通过 |
-| `decode_file()` 只返回 3 通道 | 解码器只读取颜色视频流，没有读取 AVIF 的辅助 alpha 流 | 枚举第二个视频流、提取 luma、合并 RGBA | 透明图返回 4 通道 |
-| `is_supported()` 误报 GPU 可用 | 原探测只打开编码器，没有真正送入一帧 | 改为编码一帧 `256x256` NV12 测试帧并缓存结果 | 能验证实际 NVENC 初始化和首帧编码 |
-| auto GPU 运行时失败直接中断 | 编码器打开成功不代表当前尺寸或参数一定能送帧 | `device="auto"` 在颜色编码失败时回落 CPU；`device="gpu"` 保留显式错误 | 普通图片和不支持的输入都能明确处理 |
-| 超大图片触发慢速 CPU fallback | NVENC 限制的是宽高轴，不是单纯总像素数 | 当前 benchmark 跳过宽或高超过 `8192` 的图片 | 生产路径暂时仍保留 auto CPU fallback |
+## 4. 已修复问题台账
+
+只列仍会影响理解的根因；历史复现细节见 git 记录。
+
+| 问题 | 根因 | 修复 |
+|---|---|---|
+| YUV444 GPU 编码失败 | FFmpeg profile 写成字符串 `high` | 改为整数 `profile="1"` 并同步 chroma 元数据 |
+| 透明图解码全透明 | alpha item 实际是 NV12，容器却标成 YUV400 | alpha 改用 rav1e `Cs400`，与颜色并行 |
+| `decode_file()` 只返回 3 通道 | 未读取 AVIF 辅助 alpha 流 | 枚举第二个流、提取 luma、合并 RGBA |
+| `is_supported()` 误报 | 只打开编码器，未真正送帧 | 编码一帧 256×256 NV12 并缓存结果 |
+| auto 模式 GPU 运行时失败即中断 | 打开成功不等于能送当前尺寸 | `auto` 在颜色失败时回落 CPU；`gpu` 保留错误 |
+| 超大图慢速 CPU 回退 | 继承最慢 preset | 仅 >8192 回退用 rav1e speed 7；批量默认改走 WebP |
+| alpha 偶发静默损坏 | rav1e `asm` 的 SIMD 内核在 Cs400 硬边缘内容上出错 | 去掉 rav1e `asm` feature，CDEF/LRF 保留；回归固化在 `alpha_dbg_tests` |
+| f32 输入被无条件 ACES 提亮 | 所有 float 都过 ACES | 仅 `max > 1.0` 时色调映射；LDR float 原样通过 |
+| `cq=0` 静默回落 CPU | NVENC 拒绝 qp=0 | 统一 `qp.max(1)`，不再触发回落 |
+| 灰度/错误 shape 数组 panic | 按 `len/px_count` 推 channels 未校验 | 包装层拒绝 `c ∉ {3,4}`，Rust 层校验尺寸/长度 |
+| 畸形 EXIF 让整个 AVIF 打不开 | HEIF Exif item 载荷格式与 JPEG/WebP 不同 | 统一归一化；无法识别则丢弃；去 Orientation |
+| 批处理每图多解码一次探测透明度 | header 已有 `has_alpha` 却未用 | 无 alpha 的源直接短路像素检查 |
+
+---
 
 ## 5. Windows 本地安装布局
 
-为了避免把大型开发依赖散落到系统目录，本次构建相关文件保留在项目目录：
-
 ```text
 O:\Project\Media\nvavif-py\
-├─ msys64\       MSYS2、MinGW64 工具链、NASM、clang 和包缓存
-├─ FFmpeg\       FFmpeg 8.1 源码
-├─ dav1d\        dav1d 源码
-├─ ffmpeg-out\   FFmpeg headers、import libs、DLL 和 dav1d 安装产物
-├─ source\       Python 包源码（source\nvavif_py\，maturin python-source 指向这里）
-├─ uvtest\       测试脚本和性能报告（不单独建环境）
-├─ dist-local\   maturin 构建产物（未修复 wheel，delvewheel 修复的输入）
-├─ dist\repaired-current\   delvewheel 修复后的 wheel（打包 FFmpeg DLL，venv 只装这个）
-├─ setup_env.py  环境一键固化脚本（幂等，见 §5.1）
-└─ test_imgs\    样本图片
+├─ msys64\                  MSYS2 / MinGW64 / NASM / clang（重新编译需要）
+├─ FFmpeg\                  FFmpeg 8.1 源码（产物已在 ffmpeg-out）
+├─ dav1d\                   dav1d 源码（产物已在 ffmpeg-out）
+├─ nv-codec-headers\        NVENC headers（已编进产物）
+├─ ffmpeg-out\              headers / import libs / DLL / dav1d 安装产物
+├─ source\nvavif_py\        Python 包源码（maturin python-source）
+├─ uvtest\                  测试脚本、报告、临时输出（不单独建环境）
+├─ dist-local\              maturin 构建产物（未修复 wheel）
+├─ dist\repaired-current\   delvewheel 修复后的 wheel（venv 只装这个）
+├─ .venv\                   根目录唯一环境
+├─ setup_env.py             环境一键固化（幂等）
+└─ test_imgs\               样本图片
 ```
 
-Rust 是例外：本次通过 rustup 安装后使用默认用户目录：
+Rust 在用户目录（`~/.cargo`、`~/.rustup`），不在项目内。Cargo registry、MSYS2、FFmpeg、
+dav1d 和 `ffmpeg-out` 可复用，不需要每次重装。
 
-```text
-C:\Users\ricar\.cargo\
-C:\Users\ricar\.rustup\
-```
+### 5.1 环境一键固化
 
-Rust 本身不在项目目录，但 Cargo registry、MSYS2、FFmpeg、dav1d 和生成的 FFmpeg 产物均可复用，不需要每次重装。
-
-### 5.1 环境一键固化（2026-09-05）
-
-**任何环境异常，第一反应就是重跑这条命令，不要手动修：**
+任何环境异常，第一反应是重跑，不要手修：
 
 ```bash
 uv run python setup_env.py
 ```
 
-它幂等完成四步：`uv sync`（pillow/numpy + dev 组：maturin、delvewheel、psutil、pynvml）→ 确保存在当前解释器对应的修复版 wheel（缺失则自动从 `dist-local\` delvewheel 修复到 `dist\repaired-current\`）→ 强制重装该 wheel 到根 `.venv` → 冒烟验证（根目录直接 import、GPU 探测、256×256 编解码回环）。全部通过打印 `ENV OK`。
+它幂等完成四步：`uv sync` → 确保存在当前解释器对应的修复版 wheel（缺失则自动从 `dist-local\`
+delvewheel 修复到 `dist\repaired-current\`）→ 强制重装该 wheel 到根 `.venv` → 冒烟验证
+（根目录 import、GPU 探测、256×256 编解码回环）。全部通过打印 `ENV OK`。
 
-配套的防复发配置（都在 `pyproject.toml`）：
+`pyproject.toml` 中的防复发配置：
 
-- `[tool.uv] package = false`：uv 永不安装/卸载 nvavif_py 自身。此前 `uv run` 隐式 sync 会把 venv 里的 wheel 换成坏的 editable 安装（根目录源码包无 `.pyd`），是反复环境损坏的根源。
-- `[dependency-groups] dev`：psutil/pynvml/maturin/delvewheel 进 lock，uv 精确 sync 不再误删。
-- `python-source = "source"`：Python 包挪到 `source\nvavif_py\`，仓库根目录不再存在叫 `nvavif_py` 的目录——只要根目录进了 `sys.path`（`python -c`、pytest、IDE）就遮蔽 wheel 的问题从根上消除（§9 两次踩坑的根治）。
-- 构建流程：`build.bat`（maturin build → `dist-local\`）→ `setup_env.py` 自动 delvewheel 修复 → venv。venv 里只应存在 `dist\repaired-current\` 的修复版 wheel。
+- `[tool.uv] package = false`：uv 永不安装/卸载 nvavif_py 自身，避免把 venv 里的 wheel
+  换成无 `.pyd` 的 editable 安装。
+- `[dependency-groups] dev`：psutil/pynvml/maturin/delvewheel 进 lock，`uv sync` 不会误删。
+- `python-source = "source"`：根目录不再有同名包，`sys.path` 遮蔽 wheel 的问题从根上消除。
+- 构建流程：`build.bat`（maturin build → `dist-local\`）→ `setup_env.py` 自动 delvewheel 修复 → venv。
 
-**新机器迁移（干净 clone）**：git 不携带任何构建产物——`dist-local\`、`dist\`、`target\` 均被忽略，目标机必须本地执行一次 `build.bat --out dist-local`（冷编译几分钟）再 `uv run python setup_env.py`，打印 `ENV OK` 即就绪。工具链依赖仓库内自带的 `msys64\` 与 `ffmpeg-out\`（迁移时直接整目录拷贝项目文件夹）；FFmpeg/pkg-config/LIBCLANG/NASM 变量由 `build.bat` 导出（自带 PATH/LIBCLANG_PATH）；`.cargo/config.toml` 自 2026-09-13 起**不入库**（曾在 CI 把本机路径泄漏进 Linux 构建导致失败）——`uv run` 直接构建需先从 `.cargo/config.toml.example` 复制并改成本机路径，只跑 `build.bat` 则无需该文件，运行时 DLL 由 delvewheel 打进 wheel——新机器无需手工配任何环境变量。
+**新机器（干净 clone）**：`dist-local\`、`dist\`、`target\` 均不入库；目标机执行一次
+`build.bat --out dist-local`（冷编译几分钟）再 `uv run python setup_env.py`，打印 `ENV OK` 即就绪。
+工具链依赖仓库内的 `msys64\` 与 `ffmpeg-out\`（迁移时整目录拷贝）；FFmpeg/pkg-config/LIBCLANG/NASM
+变量由 `build.bat` 导出。`.cargo/config.toml` 不入库（曾把本机路径带进 CI），需要直接 `uv run`
+构建时先从 `.cargo/config.toml.example` 复制并改成本机路径；只跑 `build.bat` 不需要。
+
+### 5.2 工具链清理
+
+2026-10-17 快照（大小为主观近似）：
+
+| 目录 | 大小 | 结论 |
+|---|---:|---|
+| `msys64/` | ~3.3 GB | 要重新编译就保留；确定不再改源码可删 |
+| `ffmpeg-out/` | ~16 MB | 保留；Cargo 构建依赖 |
+| `FFmpeg/`、`dav1d/`、`nv-codec-headers/` | 源码 | 可删；产物已在 `ffmpeg-out/` |
+| `uvtest/` | ~370 MB | 保留脚本和 `out/_key_reports/`；`out/` 其余可删 |
+| `test_imgs/` | 图片集 | 保留，作为回归基准 |
+| `~/.cargo`、`~/.rustup` | 1–2 GB | 与项目解耦，独立决定 |
+
+`.gitignore` 已排除 `msys64/`、`FFmpeg/`、`dav1d/`、`nv-codec-headers/`、`ffmpeg-out/`、`uvtest/`、
+`uv.lock`、`test_imgs/`、`.cortexkit/` 和本机 `.cargo/config.toml`。删除上面这些目录不会影响
+已安装的 wheel；只影响重新编译和重新验证的能力。
+
+---
 
 ## 6. 从 PyPI 验证安装
 
-这是验证已发布 wheel 是否能正常工作的最短路径。**所有测试脚本统一使用仓库根目录的 `.venv`（uv 环境）；`uvtest` 只是脚本目录，不单独建环境**（2026-09-05 约定：曾因 uvtest 独立 venv 导致新旧 wheel 混用、基准结果失真，已删除）：
+所有测试统一使用仓库根 `.venv`；`uvtest` 只是脚本目录，不单独建环境（独立 venv 曾导致新旧
+wheel 混用、基准失真）：
 
 ```powershell
-Set-Location O:\Project\Media\nvavif-py
 uv run python -c "import nvavif_py; print(nvavif_py.is_supported())"
-```
-
-验证脚本：
-
-```powershell
 uv run python uvtest\test_nvavif.py
 ```
 
-已发布 wheel 的优点是通过 CI 的 `delvewheel` 绑定 FFmpeg 和 MinGW runtime DLL，用户通常不需要自己安装 FFmpeg 开发环境。
+发布 wheel 由 CI 的 delvewheel/auditwheel 绑定 FFmpeg、dav1d 和 MinGW runtime，用户通常不需要
+自己安装 FFmpeg 开发环境。
+
+---
 
 ## 7. 从源码构建的依赖安装
 
 ### 7.1 Rust
-
-安装并确认：
 
 ```powershell
 rustc --version
 cargo --version
 ```
 
-本次安装过程中网络下载曾遇到问题，使用了本机代理 `127.0.0.1:2801`。代理只注入到下载子进程，没有写入持久终端环境或系统环境变量。以后遇到相同问题时也应保持这个原则。
+本次安装时网络曾受阻，使用了本机代理 `127.0.0.1:2801`。代理只注入下载子进程，不写入持久环境。
 
 ### 7.2 MSYS2
 
-项目内 MSYS2 使用 `MINGW64` 环境。CI 的关键配置也是 `msystem: MINGW64`，不能在纯 MSYS shell 中构建 FFmpeg。
-
-需要的主要工具包括：
-
-```text
-git
-make
-nasm
-mingw-w64-x86_64-gcc
-mingw-w64-x86_64-pkgconf
-mingw-w64-x86_64-meson
-mingw-w64-x86_64-ninja
-mingw-w64-x86_64-clang
-diffutils
-```
-
-关键用途：
+项目内 MSYS2 使用 `MINGW64` 环境（CI 也是 `msystem: MINGW64`，不能在纯 MSYS shell 中构建 FFmpeg）。
+需要：`git`、`make`、`nasm`、`mingw-w64-x86_64-gcc`、`pkgconf`、`meson`、`ninja`、`clang`、`diffutils`。
 
 - `nasm`：rav1e 和 dav1d 的汇编构建。
-- `mingw-w64-x86_64-clang`：为 Rust bindgen 提供 `libclang.dll`。
-- `pkgconf`：让 FFmpeg 找到本地 dav1d 和其它依赖。
+- `clang`：为 bindgen 提供 `libclang.dll`。
+- `pkgconf`：让 FFmpeg 找到本地 dav1d。
 - `meson`/`ninja`：构建 dav1d。
 
 ### 7.3 nv-codec-headers、dav1d 和 FFmpeg
 
-构建顺序：
+构建顺序：安装 `nv-codec-headers` → Meson/Ninja 构建 dav1d 到 `ffmpeg-out` →
+从 FFmpeg `release/8.1` 构建精简共享库。
 
-1. 安装 `nv-codec-headers`，提供 NVENC API headers。
-2. 使用 Meson/Ninja 构建并安装 dav1d 到 `ffmpeg-out`。
-3. 从 FFmpeg `release/8.1` 分支构建精简的共享库。
-
-FFmpeg 必须包含这些功能：
-
-```text
-av1_nvenc encoder
-libdav1d decoder
-AV1 parser
-MOV/AVIF demuxer
-file protocol
-pipe protocol
-```
-
-CI 中使用的核心 configure 选项位于 `.github/workflows/CI.yml`，Windows 构建对应以下配置：
+FFmpeg 必须包含：`av1_nvenc`、`libdav1d` 解码器、AV1 parser、MOV/AVIF demuxer、file/pipe protocol。
+CI 的 configure 选项位于 `.github/workflows/CI.yml`，与本机一致的核心是：
 
 ```bash
 ./configure \
   --prefix=$FFMPEG_OUT \
-  --enable-shared \
-  --disable-static \
-  --disable-doc \
-  --disable-programs \
+  --enable-shared --disable-static --disable-doc --disable-programs \
   --disable-everything \
-  --enable-ffnvcodec \
-  --enable-libdav1d \
-  --enable-decoder=libdav1d \
-  --enable-nvenc \
-  --enable-encoder=av1_nvenc \
-  --enable-parser=av1 \
-  --enable-demuxer=mov \
-  --enable-protocol=file \
-  --enable-protocol=pipe \
+  --enable-ffnvcodec --enable-libdav1d --enable-decoder=libdav1d \
+  --enable-nvenc --enable-encoder=av1_nvenc --enable-parser=av1 \
+  --enable-demuxer=mov --enable-protocol=file --enable-protocol=pipe \
   --extra-cflags="-I$FFMPEG_OUT/include" \
   --extra-ldflags="-L$FFMPEG_OUT/lib"
 make -j$(nproc)
 make install
 ```
 
-本次遇到过一次 `nv-codec-headers` 官方地址 TLS EOF，改用 GitHub 镜像重新下载后继续。该问题是下载链路问题，不是源代码问题。
+`nv-codec-headers` 官方地址曾出现 TLS EOF，改用 GitHub 镜像即可；是下载链路问题，不是源码问题。
+
+---
 
 ## 8. Cargo 和 maturin 本地构建
 
-`build.rs` 只在存在 `FFMPEG_DIR` 时注册 FFmpeg 的 `include`、`lib` 和 `bin` 路径。没有该变量时，Cargo 会找到 Rust 依赖，但无法正确链接本地 FFmpeg。
+`build.rs` 只在存在 `FFMPEG_DIR` 时注册 FFmpeg 的 `include`、`lib`、`bin` 路径；没有该变量时
+Cargo 能找到依赖但无法正确链接本地 FFmpeg。
 
-本地构建需要的进程级变量：
+本地构建需要的进程级变量（只作用于 Cargo/maturin 子进程，不写系统环境）：
 
 ```text
-FFMPEG_DIR=O:\Project\Media\nvavif-py\ffmpeg-out
-FFMPEG_INCLUDE_DIR=O:\Project\Media\nvavif-py\ffmpeg-out\include
-FFMPEG_LIB_DIR=O:\Project\Media\nvavif-py\ffmpeg-out\lib
-PKG_CONFIG_PATH=O:\Project\Media\nvavif-py\ffmpeg-out\lib\pkgconfig
-LIBCLANG_PATH=O:\Project\Media\nvavif-py\msys64\mingw64\bin
-CLANG_PATH=O:\Project\Media\nvavif-py\msys64\mingw64\bin\clang.exe
-PATH 中加入：
-  C:\Users\ricar\.cargo\bin
-  O:\Project\Media\nvavif-py\ffmpeg-out\bin
-  O:\Project\Media\nvavif-py\msys64\usr\bin
-  O:\Project\Media\nvavif-py\msys64\mingw64\bin
+FFMPEG_DIR=<repo>\ffmpeg-out
+FFMPEG_INCLUDE_DIR=<repo>\ffmpeg-out\include
+FFMPEG_LIB_DIR=<repo>\ffmpeg-out\lib
+PKG_CONFIG_PATH=<repo>\ffmpeg-out\lib\pkgconfig
+LIBCLANG_PATH=<repo>\msys64\mingw64\bin
+CLANG_PATH=<repo>\msys64\mingw64\bin\clang.exe
+PATH += ~/.cargo/bin, ffmpeg-out\bin, msys64\usr\bin, msys64\mingw64\bin
 ```
 
-这些变量只应作用于 Cargo/maturin 子进程，不应写入系统环境变量。示意命令：
-
 ```powershell
-$repo = 'O:\Project\Media\nvavif-py'
+$repo = (Get-Location).Path
 $ffmpeg = Join-Path $repo 'ffmpeg-out'
 $msys = Join-Path $repo 'msys64'
-
 $env:FFMPEG_DIR = $ffmpeg
 $env:FFMPEG_INCLUDE_DIR = Join-Path $ffmpeg 'include'
 $env:FFMPEG_LIB_DIR = Join-Path $ffmpeg 'lib'
@@ -267,517 +256,434 @@ cargo check
 maturin build --release --out dist-local
 ```
 
-Windows FFmpeg 构建生成的 import library 名称可能是 `avcodec.lib` 等，而 Cargo 探测需要 `libavcodec.lib` 等名称。CI 在构建 maturin wheel 前执行了对应的 `.lib` 复制/重命名步骤。
-
-本地 wheel 直接用 `maturin build` 生成时不一定包含所有 DLL，因此测试时需要把 `ffmpeg-out\bin` 和 `msys64\mingw64\bin` 加入进程 DLL 搜索路径。`uvtest/benchmark.py` 已通过 `os.add_dll_directory()` 自动处理这一步。
-
-CI 的最终 Windows wheel 还会执行：
+Windows FFmpeg 生成的 import library 名为 `avcodec.lib` 等，而 Cargo 探测需要 `libavcodec.lib`；
+CI 在 maturin 前做了复制/重命名。未 repair 的本地 wheel 不含全部 DLL，测试时需把
+`ffmpeg-out\bin` 和 `msys64\mingw64\bin` 加入进程 DLL 搜索路径（`uvtest/benchmark.py` 已用
+`os.add_dll_directory()` 处理）。发布 wheel 由 CI 执行：
 
 ```powershell
-pip install delvewheel
 delvewheel repair dist\*.whl --add-path "ffmpeg-out\bin;C:\msys64\mingw64\bin" -w dist\repaired
 ```
 
-因此发布 wheel 和本地未 repair wheel 的 DLL 行为不同，这是本次本地导入错误的来源之一。
+---
 
 ## 9. 编译过程中遇到的阻塞
 
 | 阶段 | 问题 | 解决 |
 |---|---|---|
-| 初始源码构建 | 默认 Rust 路径不存在，机器上当时没有可用 Rust toolchain | 按默认 rustup 位置安装 Rust，确认 `rustc 1.97.1` |
-| FFmpeg 链接 | 系统中已有的 `ffmpeg.exe` 只有运行时用途，没有 Cargo 所需 headers/import libs | 在项目目录重新构建 FFmpeg 开发产物 |
-| FFmpeg configure | 在纯 MSYS shell 中运行，CI 所需的 MINGW64 环境不成立 | 使用 `MSYSTEM=MINGW64`/MSYS2 MINGW64 shell |
-| rav1e 构建 | 找不到 NASM | 将 `msys64\usr\bin` 放入 Cargo 子进程 PATH |
-| bindgen | 找不到 `libclang.dll` | 安装 `mingw-w64-x86_64-clang` 并设置 `LIBCLANG_PATH` |
-| ffmpeg-sys-next | link detection probe 失败，普通 Cargo 输出没有显示真正原因 | 使用 verbose Cargo 输出，补齐 FFmpeg lib/include/pkg-config 路径 |
-| 本地 wheel 导入 | `_nvavif_py.pyd` 能找到，但 FFmpeg/MinGW DLL 无法加载 | 临时加入 `ffmpeg-out\bin` 和 `msys64\mingw64\bin` |
-| Python 测试 | 从仓库根目录用 `python -c` 启动时，根目录源码包（无 `.pyd`）shadow 了 venv 安装的 wheel | 统一根目录 `.venv`（见 §6），并按 §10 用 `uv run python uvtest\xxx.py` 运行——脚本方式下 `sys.path[0]` 是 `uvtest`，导入的是 venv 里的 wheel（2026-09-05 起不再单独从 uvtest 启动）。**2026-09-05 根治**：Python 包移至 `source\nvavif_py\`（`python-source`），根目录不再有同名包目录，遮蔽从根上不可能 |
-| Python 测试（复发） | 根目录源码包内残留旧构建的 `_nvavif_py.cp313-win_amd64.pyd`（2026-09-05 二次踩坑：`python -c` 从根目录导入时旧 `.pyd` 反而"可用"，掩盖了 venv 新 wheel，I1 改动一度"无效"） | 已删除该构建残留物；约定：`source\nvavif_py\` 里**永远不要**留 `.pyd` 构建产物。配套根治见 §5.1（`package = false` + dev 组 + `setup_env.py` 一键固化） |
-| 全量样本测试 | 超大图进入 rav1e 后耗时很长 | 本轮测试跳过宽或高大于 `8192` 的图片 |
+| 初始构建 | 机器上没有 Rust toolchain | 按默认 rustup 位置安装 |
+| FFmpeg 链接 | 系统 `ffmpeg.exe` 没有 headers/import libs | 在项目内重新构建 FFmpeg 开发产物 |
+| FFmpeg configure | 纯 MSYS shell 不满足 CI 的 MINGW64 环境 | 使用 `MSYSTEM=MINGW64` |
+| rav1e | 找不到 NASM | 把 `msys64\usr\bin` 加入 Cargo 子进程 PATH |
+| bindgen | 找不到 `libclang.dll` | 安装 clang，设置 `LIBCLANG_PATH` |
+| ffmpeg-sys-next | link probe 失败且无详细原因 | verbose Cargo 输出，补齐 FFmpeg lib/include/pkg-config |
+| 本地 wheel 导入 | `.pyd` 能找到但 DLL 加载失败 | 临时加入 FFmpeg/MinGW DLL 目录；发布版由 delvewheel 解决 |
+| 根目录导入 | 源码包遮蔽 venv wheel；残留 `.pyd` 掩盖新 wheel | 包移到 `source\nvavif_py\`，`package=false`；源码目录不留 `.pyd` |
+
+---
 
 ## 10. 测试脚本与运行方法
 
-### 10.0 命令行约定（2026-09-06）
+完整脚本索引见 `uvtest/README.md`。本节只保留运行约定和常用入口。
 
-- 工作目录在会话内持久：进入仓库根一次之后，后续命令**不要再重复 `cd` 到仓库根**，直接写相对路径（或确需跨目录时用绝对路径）。每个命令前缀 `cd <repo> &&` 属于历史噪音，新命令不应模仿。
-- 临时测试一律建在 `uvtest/out/` 下的临时目录（如 `uvtest/out/_t_xxx`），用完即删；禁止把 `test_imgs/` 当可写目录。
+### 10.0 命令行约定
+
+- 工作目录在会话内持久：进入仓库根一次后，命令直接写相对路径。
+- 临时测试建在 `uvtest/out/` 下，用完即删；禁止把 `test_imgs/` 当可写目录。
+- 所有脚本用根 `.venv`：`uv run python uvtest\<script>.py`。
 
 ### 10.1 定向功能回归
 
-脚本：[`uvtest/test_nvavif.py`](O:/Project/Media/nvavif-py/uvtest/test_nvavif.py)
+`uvtest/test_nvavif.py`：普通 JPG、RGBA PNG、显式 CPU、8/10-bit × 420/444、auto-CQ、
+NumPy u8/f32/RGBA、Pillow 插件、奇数尺寸、GPU preset timing。打印为主，无断言。
 
-覆盖：
+`uvtest/test_compress_dir_routing.py --fast`：带断言的路由回归，失败退出非 0。覆盖 JPEG 质量
+估计、不透明/透明/oversize/keep-smaller 路由、alpha 平面行为、多轮续跑；使用微型图和编码替身，
+不调用真实 AVIF 编码。
 
-- 普通 JPG 默认路径
-- RGBA PNG
-- 显式 CPU rav1e
-- 8-bit/10-bit YUV420/YUV444
-- auto-CQ
-- NumPy uint8、f32、RGBA
-- Pillow plugin
-- 奇数尺寸
-- GPU preset timing
+### 10.2 基准与批处理
 
-运行：
+`uvtest/benchmark.py`：遍历 `test_imgs`，测 encode/decode、写临时 AVIF 并验证、统计均值/中位数/P95，
+输出 `benchmark_results.json`；默认跳过任一边 >8192 的源。
 
-```powershell
-uv run python uvtest\test_nvavif.py
-```
+`uvtest/bench_opaque_formats.py`：走真实 `_encode_task` 路径比较 AVIF/WebP；详见 `uvtest/README.md`。
 
-### 10.2 固化批量测试和性能测试
-
-脚本：[`uvtest/benchmark.py`](O:/Project/Media/nvavif-py/uvtest/benchmark.py)
-
-该脚本会：
-
-- 遍历 `test_imgs` 全部图片。
-- 默认跳过宽或高超过 `8192` 的图片。
-- 测量 encode 时间和 MP/s。
-- 写入临时 AVIF 并验证 Pillow 是否能打开。
-- 调用 `decode_file()` 验证解码 shape 和 alpha 通道数。
-- 统计 encode/decode 的均值、中位数和 P95。
-- 对固定的 `1024x1024` NumPy 图分别运行 GPU/CPU 对比。
-- 写入逐图 JSON 报告。
-
-运行：
-
-```powershell
-uv run python uvtest\benchmark.py
-```
-
-报告：[`uvtest/benchmark_results.json`](O:/Project/Media/nvavif-py/uvtest/benchmark_results.json)
-
-如需修改尺寸阈值或 CPU/GPU 对比次数：
-
-```powershell
-uv run python uvtest\benchmark.py --skip-max-dimension 8192 --device-repeats 5
-```
+`uvtest/measure_ctx_overhead.py`：用 `NVAVIF_DEBUG_TIMING=1` 分解 Python 输入、RGB→YUV、context
+新建/命中/淘汰、主机帧准备、send/receive；严格 GPU 子进程，预热不计入逐图统计。
 
 ### 10.2.1 一条命令批量压缩
 
-脚本：[`uvtest/compress_dir.py`](O:/Project/Media/nvavif-py/uvtest/compress_dir.py)
-
-生产用途的直接入口：把一个文件夹里的全部图片压成 AVIF，透明 PNG 自动保留 alpha（GPU 颜色 + 快速 CPU alpha），**进程池并行编码**（每 worker 一个 NVENC 会话，`--workers` 默认 `min(8, 核数/2)`，NVENC 并发会话上限是硬顶），结束给汇总，失败的图继续跑完再报告。
+`uvtest/compress_dir.py` 是生产入口。默认：`test_imgs` → `uvtest\out\compressed`，
+≤2 MP 不透明图 WebP Q90，2–8 MP AVIF CQ36，>8 MP AVIF CQ30，真透明 WebP，
+超过 8192 的源 WebP（>16383 先缩放到 16383，否则跳过并保留源），JPEG 估计质量 <85 保留源，
+keep-smaller 与 copy-skipped 开启，workers = `min(8, 核数/2)`。
 
 ```powershell
-# 默认：test_imgs -> uvtest\out\compressed，cq=20，device=auto，8 workers
-# 默认策略：JPEG 质量基线过滤（估质量 <85 保留源文件）+ 尺寸兜底（压完不小则保留源）
 uv run python uvtest\compress_dir.py
-# web 档质量 / 指定目录 / SSIM 目标质量 / 限并行度 / 关报表
-uv run python uvtest\compress_dir.py --cq 26
 uv run python uvtest\compress_dir.py --src 某目录 --dst 某目录
-uv run python uvtest\compress_dir.py --auto-quality 80
+uv run python uvtest\compress_dir.py --cq 26
+uv run python uvtest\compress_dir.py --auto-quality 88
 uv run python uvtest\compress_dir.py --workers 4
-uv run python uvtest\compress_dir.py --min-jpeg-quality 0 --no-keep-smaller   # 全部强压
+uv run python uvtest\compress_dir.py --min-jpeg-quality 0 --no-keep-smaller
 uv run python uvtest\compress_dir.py --report none
 ```
 
-**过滤策略（2026-09-05）**：目标是"效率最好、输出永不比源大"，分两层：
+输出目录默认生成 `compress_report.json`（逐图尺寸/模式/alpha/大小/压缩率/bpp/耗时/MP/s +
+资源采样）和 `.stream.jsonl`。续跑、in-place、copy-skipped 等行为以 `PARITY_MATRIX.md` 为准。
 
-1. **事前过滤** `--min-jpeg-quality 85`：从 JPEG 量化表零成本估计源质量（IJG 逆映射，不解码像素）。低于基线的源 JPEG 已经比 cq 目标压得更狠，再编只会变大或白费时间，直接保留源文件。实测 23 张低质量 JPEG 全部零成本跳过，其中 22 张正是上一轮"压完变大"的图（96% 精确率，1 张误杀，阈值可调）。
-2. **事后兜底** `--keep-smaller`：编码后若 AVIF 不小于源文件，不落盘、保留源（兜住事前漏网的高质量但难压的图，实测拦下 1 张）。
+### 10.3 导出可查看的测试集
 
-全量实测（79 张 / 1099.5 MP，默认 cq=20）：
+`uvtest/export_test_set.py`：把通过尺寸筛选的测试图持久化为 AVIF，生成原图/AVIF 并排页面、
+`manifest.json` 和逐图验证信息。输出目录 `uvtest/out/batch_gallery` 已删除，需要时重跑即可再生。
 
-| 版本 | 耗时 | 吞吐 | 存储 |
-|---|---:|---:|---|
-| 串行初版 | 228.8 s | 4.80 MP/s | 406.4 → 132.7 MB（3.06×） |
-| 串行 + 资源报表 | 205.5 s | 5.35 MP/s | 132.7 MB（NVENC 占用 0.1%、GPU 9% → 催生方案 H/I1） |
-| 并行 + I1（8 workers） | 45.0 s | 24.4 MP/s | 130.8 MB（3.11×） |
-| **并行 + I1 + 过滤策略** | **25.7 s** | 38.5 MP/s（编码部分） | **124.2 MB（3.27×，省 69%），无任何输出比源大** |
+---
 
-不透明图冒烟 8 张达 99 MP/s。超大图（>8192）单张从 49 s 降到 16 s（方案 I1）；多张超大图并行时因 rav1e 抢核单张回升到 ~23 s，但总墙钟仍大幅受益。
+## 11. 性能基线
 
-每次运行默认在输出目录生成 `compress_report.json`：逐图（尺寸/模式/是否alpha/源大小/输出大小/压缩率/bpp/耗时/MP/s）+ 全程资源采样（CPU%/内存，含全部子进程；GPU%/NVENC 编码器占用%/显存）。后续性能优化以此为基线。
+历史全量数字（cq=20、串行版本、旧路由）不再保留；当前默认路由的对比见 §21 与
+`uvtest/README.md`。
 
-环境说明（2026-09-05 更新）：`uv run` 已可**不带 `--no-sync`** 直接使用——构建所需的 FFmpeg/pkg-config/LIBCLANG/NASM 变量固化在 `.cargo/config.toml` 的 `[env]`（**本机文件，git 不携带**，干净 clone 后从 `config.toml.example` 复制），`msys64\mingw64\bin` 已追加进用户 PATH（bindgen 的 `libclang.dll` 依赖同目录的 `libLLVM-22.dll`，普通 shell 没有该目录时加载失败，这是此前 `--no-sync` 约定的原因）。注意两点：uv 触发的是源码 editable 构建，修改 `src/*.rs` 后下次 `uv run` 会自动增量重编译；裸 `python -c` 导入仍需先注册 `ffmpeg-out\bin` DLL 目录（uvtest 脚本均已内置），用 `build.bat` 构建发布 wheel 的流程不变。
+### 11.1 语料与功能基线
 
-### 10.3 导出可查看的完整测试集
+`test_imgs` 共 79 个文件，其中 4 张任一边 >8192；格式对比用 53 张不透明源（533 MP）。
+75 张正常尺寸图片均通过 encode、Pillow 打开、`decode_file()`、RGB/RGBA 通道检查。
+透明集的可靠查看环境是浏览器和 Pillow/libheif；Windows 看图软件不合成 alpha。
 
-脚本：[`uvtest/export_test_set.py`](O:/Project/Media/nvavif-py/uvtest/export_test_set.py)
+### 11.2 批量性能与格式对比
 
-该脚本会将所有通过尺寸筛选的测试图片持久化为 AVIF，并生成原图/AVIF 对照页面、`manifest.json` 和逐图验证信息：
-
-```powershell
-uv run python uvtest\export_test_set.py
-```
-
-输出目录：[`uvtest/out/batch_gallery`](O:/Project/Media/nvavif-py/uvtest/out/batch_gallery)
-
-直接打开 [`index.html`](O:/Project/Media/nvavif-py/uvtest/out/batch_gallery/index.html) 即可查看 75 张原图和压缩图的并排对照。4 张超过 `8192` 宽或高的图片会显示在页面底部的 skipped 列表中，不会被静默遗漏。
-
-## 11. 最终测试数据
-
-### 11.1 功能结果
-
-```text
-总文件数：79
-实际测试：75
-跳过超限：4
-失败：0
-透明相关图片：21（旧 benchmark 分类，其中 11 张实际为 alpha 全 255 的不透明 RGBA；真实透明图片为 10 张）
-```
-
-75 张正常尺寸图片均通过：
-
-- encode
-- Pillow 打开
-- `decode_file()`
-- RGB/RGBA 通道数检查
-
-### 11.2 批量性能
-
-75 张图片总计约 `733.92 MP`：
-
-```text
-编码总耗时：116.36 秒
-解码总耗时：30.21 秒
-混合编码吞吐：6.31 MP/s
-单图编码中位数：346 ms
-P95 编码耗时：6.95 秒
-最大单图编码耗时：16.88 秒
-```
-
-按图片类型拆分：
-
-| 类型 | 数量 | 编码吞吐 | 平均编码 | 中位数 | P95 |
-|---|---:|---:|---:|---:|---:|
-| 不透明（旧分类） | 54 | 34.51 MP/s | 286 ms | 159 ms | 686 ms |
-| 透明相关（旧分类，含 11 张误判） | 21 | 1.99 MP/s | 4.81 s | 4.28 s | 12.69 s |
-
-后续 alpha 误判修复后，实际分类为 65 张不透明和 10 张真透明。11 张误判样本的编码总耗时从 41.58 s 降至 3.75 s，吞吐从 3.36 MP/s 提升至 37.23 MP/s，平均 11.09 倍。
-
-压缩率（默认 `cq=20`、P7、8bit YUV420，源文件为原始图片字节）：75 张源文件合计 380.7 MB → AVIF 合计 117.8 MB，约 **3.2 倍**（平均 1.26 bpp；混合集中含 JPEG 源，已压缩过所以整体倍率被拉低）。透明 PNG 子集（调参前基准，21 张 131.3 MB → 16.3 MB）约 8 倍；alpha 提速档（speed 9）后文件约 +16%，透明 10 张 / 61.25 MP 实测 29.6 MB → 6.1 MB，约 **4.9 倍**、省 80%。
+53 张不透明源、8 worker、固定 CQ20（历史对比，当前默认见 §21）：AVIF 与 WebP 总墙钟与 Σ任务时间基本打平
+（3.53–3.58 s vs 3.48–3.50 s），但逐图配对后分桶明显：<8 MP WebP 更快（0.24×），
+≥8 MP AVIF 更快（1.36×）。命中 NVENC context 后交点下移到 1.75–2.39 MP，故默认阈值取 2 MP。
+体积/画质（`compare_runs.py`，相对 WebP Q90）：CQ20 1.58× / LPIPS 0.0101；
+CQ30 1.30–1.32×（8–32 MP）；CQ36 1.06–1.13×（2–16 MP）。CQ20/30/36 与 WebP Q90 不是对齐质量，
+字节差不能单独当画质判定；最终以 LPIPS + 人工核验为准。
 
 ### 11.3 GPU/CPU 固定图对比
 
-输入为同一个 `1024x1024` NumPy uint8 RGB 数组，重复 5 次并排除第一次初始化：
+`1024×1024` NumPy uint8 RGB，5 次重复、排除首次初始化：GPU NVENC 98.8 ms（10.6 MP/s），
+rav1e CPU 6672.7 ms（0.157 MP/s），约 **67.6×**；该样本 GPU 输出约大 39%（tune=hq）。
+透明图不能直接用这个倍数估算，因为 alpha 仍走 CPU（批量默认已整体路由 WebP）。
 
-| 路径 | 平均编码 | 中位数 | 吞吐 |
-|---|---:|---:|---:|
-| GPU NVENC | 98.8 ms | 100.0 ms | 10.6 MP/s |
-| CPU rav1e | 6672.7 ms | 6679.6 ms | 0.157 MP/s |
+### 11.4 alpha 速度调参与 rav1e asm 修复
 
-该样本上 GPU 约为 CPU 的 `67.6x`。透明图的整体速度不能直接使用这个倍数估算，因为 alpha 流仍然由 CPU rav1e 编码。
+`ALPHA_RAV1E_PRESET = 2`（rav1e speed 9），alpha 不继承颜色 preset（默认 P7 → speed 4/5）。
+同 10 张透明图（61.2 MP）：基线 speed 5 约 93.7 s → speed 9 约 5.95–9.8 s（~10–15×），
+文件增大 10–25%，alpha MAE 约 0.035–0.14/255。
 
-### 11.4 alpha 速度调参（2026-09-05）
+alpha 曾出现两张图解码错误（MAE 75–153）。根因是 rav1e 0.7.1 的 NASM SIMD 内核在本机工具链下
+对 Cs400 硬边内容产生静默损坏；`cdef.rs:95` 的 debug_assert 只是症状。修复方式是
+`Cargo.toml` 去掉 rav1e `asm` feature（保留 `threading`），CDEF/LRF 照常。ffmpeg 独立解码与
+`decode_file()` 错误一致，证明码流本身坏了。回归固化在 `src/lib.rs` 的 `alpha_dbg_tests`；
+若未来恢复 asm，必须先换可信 NASM 构建并重跑该回归。
 
-`src/lib.rs` 新增 `ALPHA_RAV1E_PRESET`（=2，对应 rav1e speed 9），alpha 编码不再继承颜色 preset（默认 6 → speed 5）。同 10 张透明图（61.2 MP）、`encode_file` 默认参数 A/B：
-
-| 配置 | 总耗时 | 吞吐 | 12MP 单图 | 12MP 文件大小 | alpha MAE（正常图） |
-|---|---|---|---|---|---|
-| 基线 speed 5 | 93.67 s | 0.65 MP/s | 11.3~26.3 s | 975 KB | 0.005~0.09 |
-| speed 8 | 11.43 s | 5.36 MP/s | 1.6~2.8 s | 1,041 KB | 0.07~0.17 |
-| speed 9（采用） | 5.95~9.8 s | 6.25~10.3 MP/s | 0.85~1.36 s | 1,143 KB | 0.035~0.14 |
-
-speed 9 比 speed 8 再快约一倍，文件大约 10%，保真度相当，选为默认。alpha 量化器逻辑不变（`a_cq = cq - 4`）。
-
-同时发现一个独立 bug：`0-16 07-57-11.png` 和 `13 07-56-48-9236.png` 两张图无论 Pillow 插件还是 `decode_file()` 解码出的 alpha 都与源图不符（MAE 75~153，max 255），且与 alpha 编码速度设置无关（基线和调参后同样出现）。
-
-**已修复（2026-09-06），根因是 rav1e 的 `asm` 特性**： rav1e 0.7.1 的 NASM SIMD 内核在本机工具链（nasm-rs 自编译 NASM）下对硬边、大面积平坦的单色内容（二值 alpha 掩码）产生**静默损坏的重建像素**——Cs420 颜色路径同一内容正常，Cs400 alpha 路径触发；CDEF 的 `cdef.rs:95` debug_assert 是症状不是病因（debug 构建直接 panic，release 构建 assert 被编译掉、静默输出坏码流）。用 ffmpeg 独立解码与 `decode_file()` 错误完全一致，证明容器里的码流本身就是坏的；这也解释了浏览器中透明显示异常（浏览器如实合成坏 alpha）而 Windows 看图软件"黑底正常"（不合成 alpha）。
-
-修复：`Cargo.toml` 中 rav1e 去掉 `asm` feature（`features = ["threading"]`），CDEF/LRF 照常开启。验证（一次性诊断脚本 `uvtest/diag_alpha_bug.py`，已随 2026-09-06 清理删除，复现用例固化在 lib.rs 回归测试中；3 张图）：两张问题图 alpha MAE 153.17/141.47 → **0.05/0.03**，ffmpeg 参考解码一致；10 张透明图全集 61.2 MP 单进程 10.88 s（5.63 MP/s，比 asm 版慢约 10~25%，可接受），最差 alpha MAE 0.054。回归测试固化在 `src/lib.rs` 的 `alpha_dbg_tests`（输入 fixture 原由 `diag_alpha_bug.py` 生成，脚本删除后 fixture 缺失时跳过）。若未来要恢复 asm，需先换可信 NASM 构建并重跑本回归。
-
-脚本：`uvtest/bench_alpha_tuning.py`；报告：`uvtest/out/alpha_tuning/*.json`。
+---
 
 ## 12. NVENC 尺寸限制
 
-当前 RTX 4070 + FFmpeg 8.1 运行时实测：
+RTX 4070 + FFmpeg 8.1 实测：每轴上限 **8192**，不是总像素数。
 
 ```text
-8192 x 256  -> GPU 成功
-8194 x 256  -> GPU 失败
-256 x 8192  -> GPU 成功
-256 x 8194  -> GPU 失败
+8192 x 256  -> 成功        8194 x 256  -> 失败
+256 x 8192  -> 成功        256 x 8194  -> 失败
 ```
 
-也就是宽度和高度各自不能超过 `8192`。限制不是总像素数：
+最小帧尺寸实测 **宽 ≥130、高 ≥66**（128×130 失败，130×66 成功，130×65 失败）。
+库在 `auto` 下会把小图/超限图交给 CPU；批处理则在扫描阶段直接跳过小图（`skipped_small`），
+超限图默认走 WebP，不再进入 rav1e。
 
-- `9504x6336` 只有约 `44.8 MP`，但宽度超过限制，仍然失败。
-- `8192x8192` 约 `67.1 MP`，在轴限制内。
-- `11648x8736` 约 `101.8 MP`，两个轴都超过限制。
+超限回退的 CPU 颜色编码使用 `OVERSIZE_RAV1E_PRESET = 4`（rav1e speed 7，仅 >8192 生效）：
+101.7 MP 单张 49.4 s → 16.2 s（3.04×），文件 -13.5%，SSIM -0.012。库本身不缩放；需要缩放时由
+批处理的 `--oversize-max-edge` 显式完成。
 
-这是 NVENC 硬件限制，不是 AVIF 容器格式的总像素限制。当前库不会自动缩放原图；`auto` 会尝试 GPU，失败后保持原始尺寸改用 CPU。
-
-超限回退的 CPU 颜色编码不再继承最慢档 preset（2026-09-05，方案 I1）：`src/lib.rs` 中 `OVERSIZE_RAV1E_PRESET = 4`（rav1e speed 7）仅对宽或高超过 `8192` 的图生效，普通图的瞬时 NVENC 失败仍保持原 preset。实测 101.7MP 单张 49.4 s → 16.2 s（3.04×），文件 -13.5%，SSIM -0.012（复验脚本 `uvtest/test_oversize_preset.py`）；画质敏感场景用 `auto_cq` 或显式 `device="cpu"`。
+---
 
 ## 13. 原生 NVENC monochrome 探测
 
-为了确认透明 alpha 是否可以绕过 FFmpeg，直接使用 NVENC 原生 API 编码，曾新增固定测试脚本（2026-09-05 实验结束后已随实验清理删除，本节保留记录）：
-
-```bash
-bash uvtest/probe_nvenc_monochrome.sh
-```
-
-脚本使用项目内的 MSYS2 GCC 编译 `uvtest/nvenc_monochrome_probe.c`，动态加载系统的 `nvcuda.dll` 和 `nvEncodeAPI64.dll`，然后依次执行：
-
-1. 创建 CUDA context 和 NVENC session。
-2. 确认 AV1 codec GUID 是否存在。
-3. 查询 `NV_ENC_CAPS_SUPPORT_MONOCHROME`。
-4. 输出 AV1 支持的输入 buffer 格式。
-5. 如果 capability 报告支持，再尝试初始化 monochrome session 并编码一帧。
-
-本机结果：
+本机（RTX 4070 + 当前驱动）结果：
 
 ```text
-CUDA_CONTEXT=ready
-NVENC_SESSION=ready
 AV1_GUID=present
 AV1_MONOCHROME_CAPABILITY=0
 AV1_INPUT_FORMATS=NV12,YV12,IYUV,YUV420_10BIT,...
-AV1_MONOCHROME_RESULT=not_reported
 ```
 
-结论是当前 RTX 4070 + NVIDIA 驱动支持 AV1 NVENC，但没有报告 AV1 monochrome 能力。方案 B 在本机不能安全实施；继续用 NV12 编码后伪装成 YUV400 仍然会有跨解码器兼容性问题。实验脚本已删除；如需在更换 GPU 或驱动后复测，可按本节步骤重写（编译 C probe、查询 `NV_ENC_CAPS_SUPPORT_MONOCHROME`），不改变库的默认编码路径。
+没有 AV1 monochrome 能力，方案 B 在本机不能安全实施。用 NV12 编码后伪装 YUV400 会有跨解码器
+兼容性问题。换 GPU/驱动后只有在 `NV_ENC_CAPS_SUPPORT_MONOCHROME=1` 时重新评估。
+详见 `OPTIMIZATION_PROPOSALS.md` 方案 B。
+
+---
 
 ## 14. 强制 CUDA alpha 实验与 Intel 源码核对
 
-为了验证“即使绕过库，也把 alpha 灰度帧强行送给 GPU”是否可行，曾新增固定脚本（已随 2026-09-05 实验清理删除）：
+### 14.1 RTX 4070 的 HEVC alpha layer
 
-```bash
-uv run python uvtest/force_gpu_alpha_experiment.py
-```
+NVENC HEVC 提供 `NV_ENC_CAPS_SUPPORT_ALPHA_LAYER_ENCODING`。本机 probe：
+`HEVC_ALPHA_CAPABILITY=1`，ARGB 输入编码成功，输出含基础层与 alpha 层（5 + 3 个 NAL）。
+但 libheif 1.23.1 不支持 layered HEVC 的 `lhv1` item，现有容器生态接不上，保留为历史结论。
 
-脚本通过 FFmpeg 的 `-init_hw_device cuda=nv:0` 强制初始化 CUDA，并用 `av1_nvenc` 测试同一张 `1024x1024` alpha 灰度图：
+### 14.2 双单层 HEVC + 标准 HEIC 双 item
 
-| 测试 | 结果 | 说明 |
-|---|---|---|
-| `gray -> av1_nvenc` | 失败 | FFmpeg 最终选择 `YUV444P`，NVENC 报 `YUV444P not supported` |
-| 显式输出 `gray` | 失败 | FFmpeg 报 `gray` 不兼容并自动选择 `gbrp`，随后 NVENC 仍报 `YUV444P not supported` |
-| `gray -> yuv420p -> av1_nvenc` | 成功，约 `230 ms` | `ffprobe` 识别为 AV1 `Main/yuv420p`，不是 monochrome |
-| `gray -> yuv444p -> av1_nvenc` | 失败 | 当前 RTX 4070 NVENC 报 `YUV444P not supported` |
+用两条普通单层 `hevc_nvenc`（颜色 NV12；alpha 用 `alphaextract` 为 luma，色度 128，全范围
+`yuvj420p(pc)`），封装为标准 HEIC 的 primary `hvc1` + `auxl` alpha item，全程不用 `lhv1`。
+libheif、FFmpeg、Windows WIC 三方解码验证通过，500×500 QP26 下双流全 GPU 约 0.56 s。
 
-项目 API 的同轮参考结果约为：`device="cpu"` `2.2 s`，`device="gpu"` `2.4 s`。后者的颜色流使用 GPU，但 alpha 仍然由 rav1e CPU 编码；两个输出经 Pillow 都是 RGBA，alpha 范围为 `0..255`。这不是全量 benchmark，只是用于确认 alpha 编码路径和硬件输入格式的短实验。
+关键封装字节（重建时用）：
 
-同时从官方 Git 源码核对了 Intel 路径：
+- `ipma`：`entry_count u32` + 每项 `item_ID u16 + association_count u8 + 关联表`，多写一个 u16 会全表错位。
+- `hvcC` 的 chromaFormat 按 libheif 惯例是 `chroma_format | 0xFC`，4:2:0 写 `0xFD`；写 `0xFC` 会被读成 monochrome。
+- 每个 item 的 `hvcC` 只放自己流里的 VPS/SPS/PPS；item 数据只放 slice NAL。
+- `ftyp` major brand 用 `heic`。
 
-- oneVPL GPU runtime 当前源码的 AV1 encoder capability 配置只有 `NV12`、`P010`、`AYUV`、`Y410`，没有 `YUV400`/monochrome。Raptor Lake-S 的 PCI ID 被映射到 ADL-S runtime，不能因此获得额外的 monochrome 编码能力。
-- Intel media-driver 的 AV1 8-bit/10-bit 编码输入表只有 `NV12`/`P010`；表中 `YUV400` 只出现在 JPEG 输出说明中，不是 AV1 encoder 输入。
-- 参考源码：
-  - https://github.com/oneapi-src/oneVPL-intel-gpu/blob/master/_studio/mfx_lib/encode_hw/av1/agnostic/base/av1ehw_base_query_impl_desc.cpp
-  - https://github.com/intel/media-driver/blob/master/docs/media_features.md#supported-encoding-input-format-and-max-resolution
+**否决原因**：Windows 看图软件对所有 HEIC/AVIF 的 alpha 均不合成，浏览器不支持 HEIC——
+透明 HEIC 在日常查看环境没有正确显示场景，只能用于 libheif 生态（服务端/自研管线）。
 
-因此，i7-14700K 的 UHD 770 即使可以通过 Intel QSV/oneVPL 编码普通 AV1，也没有源码依据表明它能编码 AVIF 所需的 monochrome alpha。不能把它当作当前 RTX 4070 的替代全 GPU alpha 路径；换 Intel GPU 时仍应先用实际 capability/query 和透明度解码测试确认。
+### 14.3 Intel UHD 770 对照
 
-### 14.1 RTX 4070 的 HEVC alpha layer 实测
+oneVPL/media-driver 当前 AV1 encoder 输入只有 NV12/P010/AYUV/Y410，没有 YUV400；
+`YUV400` 只出现在 JPEG 或解码路径。i7-14700K 核显不能视为可编码 AVIF monochrome alpha。
 
-由于项目目标是高压缩率和保真度，不应只因为 AV1 alpha 无法全 GPU 就排除其它图片容器。NVIDIA NVENC API 对 HEVC 提供独立的 alpha layer 能力：
-
-- capability：`NV_ENC_CAPS_SUPPORT_ALPHA_LAYER_ENCODING`
-- 配置项：`NV_ENC_CONFIG_HEVC::enableAlphaLayerEncoding`
-- 输入格式：NV12、ARGB、ABGR 等；本次使用 `ARGB`
-- 输出锁定信息：`NV_ENC_LOCK_BITSTREAM::alphaLayerSizeInBytes`
-
-探针脚本（`probe_nvenc_monochrome.sh` + `nvenc_monochrome_probe.c`，已删除）通过环境变量把实际 ARGB 图像交给 HEVC encoder：
-
-```text
-NVENC_MAX_API_VERSION=13.1
-HEVC_GUID=present
-HEVC_ALPHA_CAPABILITY=1
-HEVC_ALPHA_INPUT_FORMAT=ARGB
-HEVC_ALPHA_ENCODE=NV_ENC_SUCCESS (0) total_bytes=128131 alpha_bytes=11890
-```
-
-对输出码流解析 NAL layer ID 的结果为 5 个基础层单元和 3 个 alpha 层单元；alpha 层的 IDR NAL 存在，大小为 `11886` 字节。这个结果证明当前 RTX 4070 可以由 GPU 同时生成 HEVC 基础层和 alpha 层，不是把灰度内容伪装成普通色彩视频。
-
-结果文件（2026-09-05 实验清理时已删除，结论保留在本节）：
-
-- `uvtest/out/gpu_alpha_experiment/hevc_alpha_image_result.json`
-- `uvtest/out/gpu_alpha_experiment/nvenc_hevc_alpha_probe.h265`
-- `uvtest/inspect_hevc_layers.py`
-- `uvtest/test_hevc_alpha_image.py`
-
-本机 `libheif 1.23.1` 的 CPU 基线命令也能将相同 RGBA 图像写成 HEIC，并生成主图加 alpha auxiliary image。但当前 libheif 源码明确将 layered HEVC item type `lhv1` 标记为尚未支持；而 NVIDIA HEVC alpha 输出正是 layered HEVC 结构。普通 `hevc_nvenc` 只暴露 RGBA 输入，不会自动打开 alpha layer 配置。因此，当前结果是“GPU HEVC alpha 编码可行，现有 libheif 不能直接封装/解码该 layered HEVC”，还不能把它直接接入生产转换路径。
-
-下一步如果继续做 HEIF，需要实现或引入支持 `lhv1` 的封装/解码链路，并使用文件大小、SSIM/其它保真指标和编码时间，与当前 AVIF 结果做同源图片对比。单纯把 `.h265` 改名为 `.heic` 不构成有效的 HEIF 文件。layered 路线保留为历史结论；绕开 `lhv1` 的单层双 item 方案见 14.2，已验证容器层可行。
-
-### 14.2 双单层 NVENC HEVC + 标准 HEIC 双 item 实验（2026-09-05）
-
-14.1 的 layered 路线被容器生态卡死后，验证了第三条路：不使用 NVENC alpha layer，改用两条普通**单层** `hevc_nvenc` 流：
-
-- 颜色流：NV12。
-- alpha 流：FFmpeg `alphaextract` 把 alpha 平面提取为 luma，色度填中性 128。注意 `format=gray` 是取 RGB 亮度而非 alpha，会静默丢掉透明信息。
-- 两条流都必须是全范围：`scale=out_range=pc` + `-color_range pc`，最终码流为 `yuvj420p(pc)`。有限范围会让 mc=0 读取端的 alpha 整体偏移约 16~27（实测平均 19.5）。
-
-封装为标准 HEIC 双 item：primary `hvc1` + alpha `hvc1`，`iref auxl` 指向主图，alpha item 带 `auxC urn:mpeg:hevc:2015:auxid:1` 和 `colr nclx matrix_coefficients=0`（读取端据此把 4:2:0 码流当作 luma-only）。全程没有 `lhv1`。
-
-封装实现踩过的坑（脚本已修正）：
-
-- `ipma` 格式为 `entry_count u32` + 每项 `item_ID u16 + association_count u8 + 关联表`，多写一个 u16 会让全部属性关联错乱、文件被判无效。
-- `hvcC` 的 chromaFormat 字节按 libheif 的惯例是 `chroma_format | 0xFC`，4:2:0 写 `0xFD`；写成 `0xFC` 会被读成 monochrome。
-- 每个 item 的 `hvcC` 只放自己流里 layer 0 的 VPS/SPS/PPS；item 数据只放 slice NAL。
-- `ftyp` major brand 用 `heic`，与 libheif 输出一致。
-
-验证结果（500x500 真透明 PNG，QP26）：
-
-| 读取方 | 结果 |
-|---|---|
-| FFmpeg（mov demuxer + hevc 解码） | 两个 `hvc1` 流均解析解码；alpha luma 平均误差 `0.015`（max 6）；颜色 MAE 2.2 |
-| libheif（pillow-heif） | 返回 RGBA；alpha 平均误差 `0.015`（max 6）；颜色 MAE 2.1。mc=0 + 4:2:0 编码的 alpha item 被正确当作 luma-only |
-| Windows WIC Microsoft HEIF Decoder | 成功打开并解码（FRAMES=1，500x500），与 libheif 参考件行为一致 |
-
-WIC 注意事项：WPF `CopyPixels` 查询对 alpha HEIC 一律返回 `Bgr32` 全不透明——libheif 参考件和标准 pillow-heif 编码的 alpha HEIC 也一样。所以该测试只验证"能打开"，不验证透明合成。
-
-性能（500x500，含进程启动开销）：颜色 0.30s + alpha 0.26s ≈ `0.56s`，双流全部 GPU。同图当前 AVIF 路径（GPU 颜色 + CPU rav1e alpha）为 `1.07s`，输出 78.3 KB vs 双 item HEIC 34.6 KB。两者 QP/CQ 设置不同，文件大小不能当作画质等价对比；alpha 流只占 2.5 KB。
-
-风险与未决事项：MIAF 严格定义要求 alpha 辅助图为 monochrome 编码（libheif 参考件是 HEVC Rext gray）；本方案是“语义 monochrome（mc=0）、编码 4:2:0”。libheif、FFmpeg、Windows WIC 都接受，但商业解码器（Apple、具体图片软件）的兼容性需要人工打开目标软件确认。
-
-查看环境实测结论（2026-09-05）：Windows 看图软件对 AVIF/HEIC 的 alpha **一律不合成**——本方案双 item HEIC、标准 libheif 编码的 `pillowheif_reference.heic`、以及 nvavif 输出的透明 AVIF，在看图软件里全部显示黑色背景（与 WIC 查询一律返回 `Bgr32` 的实测一致）；Photoshop 不支持这些格式；浏览器显示透明 AVIF 正确。黑底是查看器解码路径的限制，不是文件缺陷。
-
-由此确定两条路线的实际可用范围：透明 AVIF（GPU 颜色 + CPU alpha）在浏览器/libheif 生态透明正确，但 alpha CPU 编码太慢（平均约 4.8s/张），作为生产路径必须先做 alpha 提速优化；全 GPU 双 item HEIC 编码快，但看图软件黑底、浏览器又不支持 HEIC，在日常查看环境中没有透明可见的场景，不能作为通用透明图输出，仅适用于 libheif 生态（服务端/自研管线）。
-
-实验文件（脚本与输出已于 2026-09-05 清理，结论保留在本节）：
-
-- `uvtest/test_hevc_dual_heic.py`（端到端：编码、封装、三方验证、计时）
-- `uvtest/build_hevc_alpha_heic.py`（双 item BMFF 封装器）
-- `uvtest/inspect_heic_boxes.py`（HEIF box 树检查）
-- `uvtest/test_windows_heif_decoder.py`（Windows WIC 解码验证）
-- `uvtest/out/gpu_alpha_experiment/nvenc_hevc_dual_hvc1.heic`
-- `uvtest/out/gpu_alpha_experiment/dual_hevc_heic_result.json`
-
-如需重建该路线，可按本节的封装规范（ipma/hvcC/auxC/colr 关键字节）与踩坑记录重写。
+---
 
 ## 15. 后续工作建议
 
-当前优先级最高的性能问题是 alpha：
+默认批处理已经没有未落地的性能项；剩下都是**条件触发**，详见 `OPTIMIZATION_PROPOSALS.md`：
 
-1. 对 capability probe 报告支持的硬件，再研究 NVENC 原生 monochrome 会话和 AVIF alpha 流的完整封装。
-2. 透明图生产提速：rav1e alpha 速度参数/线程调优优先（文件仍是标准 AVIF）；其次评估方案 A alpha 下采样的兼容性。14.2 的 HEIC 双 item 方案经看图软件实测透明不可见，保留为 libheif 生态备选，不作为通用输出后端。
-3. 当前机器继续优化 rav1e alpha 路径或减少 alpha 编码的 CPU 成本。
-4. 透明大图保持颜色 GPU、alpha CPU 并行，不要为了追求“全 GPU”而重新使用不符合 AVIF 规范的 NV12 alpha。
-5. 在生产编码前增加 NVENC 尺寸 capability 检查，超过 `8192` 时直接选择 CPU，避免先触发一次 NVENC 错误。
-6. 对 YUV444 显式 GPU 增加按运行时 capability 的测试和清晰错误信息。
+- 语料出现 >16383 且必须输出 AVIF → 方案 I2（AVIF grid）。
+- 透明图必须输出 AVIF 且 CPU alpha 成本不可接受 → 方案 A。
+- 要在另一台机器上追求全 GPU alpha → 先 probe `NV_ENC_CAPS_SUPPORT_MONOCHROME`（方案 B）。
+- 确有单二进制/无人值守需求 → 方案 R，验收用 `PARITY_MATRIX.md`。
+- 换掉 Pillow 单线程解码器（nvJPEG/TurboJPEG MT）理论上有空间，但未证伪也未实现。
 
-暂时保留项目目录中的 `msys64`、FFmpeg 源码、dav1d 源码和 `ffmpeg-out`，后续修改 Rust 或重新打包 wheel 时可以直接复用。
+运维侧保留：长路径开启 `LongPathsEnabled`、图库保持子目录结构、输出目录加 Defender 排除、
+8192 级大图 × 高 worker 数时关注显存与静默 CPU 回退。
 
-## 16. NVENC 上下文 LRU 复用（2026-09-06，方案 Q 落地）
+---
 
-动机与实测见 OPTIMIZATION_PROPOSALS 方案 Q 落地结果。实现要点与踩坑：
+## 16. NVENC 上下文 LRU 复用
 
-- **实测前提**：`encode_av1_frame_gpu` 每次打开 av1_nvenc 上下文实测 ~80 ms（`NVAVIF_DEBUG_TIMING=1` 的 stderr 计时插桩），占 512×512 单图墙钟 ~75%；文档此前"5~20 ms"的估计是错的。
-- **缓存设计**：lib.rs 进程内 `GPU_ENCODER_CACHE`（`Mutex<Vec<(GpuKey, Encoder)>>`，Vec 当 LRU 用）。key = (宽，高，像素格式，preset，cq)——constqp/preset 烧在会话里，任何打开选项不同都不可复用。
-- **正确性依据（测试锁定）**：`gop=0 + forced-idr` 下每帧都是关键帧，FFmpeg nvenc 对 AV1 硬编码 `repeatSeqHdr=1`（nvenc.c:1722），因此复用会话的每个包都是自包含 AV1 流；`src/lib.rs` 的 `ctx_reuse_tests::reused_session_output_matches_fresh_session` 断言复用会话第 2 帧与全新会话输出解码 MAE=0.0 且各自独立可解码。命中路径不 `send_eof`（`delay=0` 时包在 `send_frame` 后立即可收），EOF 语义交给 context 的 Drop。
-- **容量 = 会话预算**：`NVAVIF_CTX_CACHE`（默认 1 = 峰值会话数与旧的开/关行为相同；0 = 禁用复用）。`compress_dir.py` 设 `max(1, NVENC_SESSION_LIMIT // workers)`，`workers × 容量 ≤ 8` 恒成立。
-- **坑 1（先开后驱逐 → 会话数/显存双超）**：miss 路径若先开新上下文再驱逐旧的，每 worker 瞬时持有 2 个会话——8 worker 超 8 会话上限、NVENC 缓冲显存翻倍（峰值 9.1 GB），语料最大图 NVENC 初始化失败**静默回落 CPU**（1.65 s → 70 s，且单图输出变小，容易被误读成"压缩率改善"）。必须**先驱逐再开**，保证任意时刻每 worker ≤1 个会话。
-- **坑 2（拿显存换时间）**：缓存命中间隙常驻上一个上下文，8 worker 常驻缓冲使 VRAM 均值/峰值上移（本机 12 GB 峰值 8.1 GB 无压力）；小显存 GPU 上应下调 worker 数或容量。
-- **收益边界**：只对"同尺寸密集语料"（cq20 25×，107.9 → 4.3 ms/张）与"auto_cq 语料"（试编码上下文固定 512×512，与源尺寸无关，容量 ≥3 时任意语料 3.1×、同尺寸 15.7×）生效；尺寸互异 + 固定 cq 的语料零收益零伤害（全量 79 张语料输出与改前逐字节一致）。
-- 批量侧接入：`compress_dir.py` worker 环境变量 + 报表 `ctx_cache_per_worker` 字段；测量工具 `uvtest/measure_ctx_overhead.py`（单进程合成语料 + stderr 计时聚合）。
+- **实测前提**：`av1_nvenc` 打开上下文约 **80 ms/次**，占 512×512 单图墙钟约 75%。
+- **缓存设计**：`GPU_ENCODER_CACHE`（`Mutex<Vec<(GpuKey, Encoder)>>` 当 LRU）。key =
+  `(宽, 高, 像素格式, preset, cq)` 五项精确匹配；constqp/preset 烧在会话里，任何打开选项不同都不可复用。
+- **正确性**：`gop=0 + forced-idr` 下每帧都是关键帧，FFmpeg nvenc 对 AV1 硬编码 `repeatSeqHdr=1`；
+  `ctx_reuse_tests::reused_session_output_matches_fresh_session` 断言复用会话第 2 帧与全新会话
+  输出解码 MAE=0.0 且各自可独立解码。命中路径不 `send_eof`。
+- **容量**：`NVAVIF_CTX_CACHE`（默认 1；0 禁用）。批处理设 `max(1, NVENC_SESSION_LIMIT // workers)`，
+  恒有 `workers × 容量 ≤ 8`。
+- **坑 1**：miss 必须先驱逐再开。先开后驱逐会让每 worker 瞬时持 2 个会话，8 worker 超 8 会话上限、
+  显存翻倍，最大图 NVENC 初始化失败后静默回落 CPU（1.65 s → 70 s，输出变小，容易被误读成压缩率改善）。
+- **坑 2**：常驻上下文是拿显存换时间（本机 12 GB 峰值 8.1 GB 无压力；小显存要下调 worker/容量）。
+- **收益边界**：只对同尺寸密集语料和 auto_cq 试编码（固定 512×512）有效；尺寸互异 + 固定 cq
+  的语料零收益零伤害。当前实测：同尺寸命中约 16.5 ms/张，两尺寸交替 evict+open 约 224 ms/张，
+  每 worker 首张约 479 ms；小图上命中与不命中可差 8×。
+- **注意**：进程首次 256×256 硬件探测也占一格缓存，容量 8 实际只装 7 个真实尺寸。
 
-## 17. auto_cq 逐图 CQ 分布与 CQ 边界分析（2026-09-06）
+---
 
-逐图标定 CQ 已随报表留档（`encode_avif` 返回 (bytes, final_cq)，`encode_file(with_cq=True)`，报表 AVIF 行 `cq` 字段，PARITY_MATRIX M9）。test_imgs 全量（41 张 AVIF，`--auto-quality 90`，目标 SSIM 0.995）实测分布 `{16:14, 19:1, 20:1, 22:1, 25:1, 26:3, 30:2, 39:1, 40:1, 43:1, 45:2, 50:1, 51:12}`——横跨 16~51 且与内容强相关：**大照片 JPEG 标到 16（safeguard 钉住，SSIM 渐近线），简单图形/waifu2x PNG 标到 51**。按桶的存储对比（AVIF 路由，keep-smaller 口径）：
+## 17. auto_cq 逐图 CQ 与边界
 
-| 桶 | 张数 | auto q90 | auto q88 | 固定 CQ20 |
-|---|---|---|---|---|
-| CQ16（大照片） | 14 | 65.5 MB | 61.6 MB | 59.3 MB |
-| 中间 19–45 | 14 | 32.8 MB | 28.5 MB | 35.7 MB |
-| CQ50+（简单图形） | 13 | 6.4 MB | 6.4 MB | 11.0 MB |
-| 合计 | 41 | 104.7 MB | 96.5 MB | 106.0 MB |
+auto_cq 用两张 512×512 马赛克试编码 + 割线外推，再全分辨率编码一次；额外成本约几十毫秒，
+不是 3× 全图编码（方案 L 已证伪）。逐图结果写入报表 `cq` 字段（`encode_file(with_cq=True)`）。
 
-结论：
+历史分布（41 张 AVIF、`--auto-quality 90`、目标 SSIM 0.995）：CQ16 14 张、19–45 14 张、
+50–51 13 张。大照片被 safeguard 钉在 16，简单图形到 51。当时结论：下限 16 的 safeguard 已足够，
+上限 51 无过度压缩证据，不需要新增 clamp；`--auto-quality 88` 在混合图库上存储更省。
 
-- **固定 CQ20 的总量与 auto q90 几乎持平（106.0 vs 104.7 MB）纯属两桶反向抵消**：大照片省 6.2 MB（SSIM 仅降 0.0006~0.0009，实测 8 张 12–24 MP 照片），但中间桶 +2.9 MB、图形桶 +72%（6.4→11.0 MB），且丢失 keep-smaller 对"压不动的小图"的保护（4 张小 JPG 在 CQ20 下以 SSIM 0.983~0.994 被存储，auto 下保留源）。
-- **CQ 边界不需要新增 clamp**：下限已有 safeguard 钉 16（防噪声图冲 CQ0 爆体积），上限 51 只在"连 51 都满足 SSIM 目标"时达到（图形桶仅 6.4 MB，无过度压缩证据），外加 keep-smaller 兜底。存储多少的真正旋钮是 `--auto-quality`：**90→88 实测全面占优**（96.5 MB，比固定 CQ20 还少 9.5 MB，同时保留逐图自适应，照片 16–18、图形仍 51）。
-- 大图不必单独固定 CQ20；若语料几乎全是照片且接受轻微质量损失，固定 20 可再省 ~9.5%。
-- **已采纳**：`compress_config.json` 的 `auto_quality` 设为 88（混合图库的标准配置）。
-- **CLI 默认值已对齐 config（2026-09-06）**：`--auto-quality` 默认 88、`--oversize-max-edge` 默认 16383（0 = 关），裸跑 = 生产行为；新增 `--fixed-cq` 开关退回固定 `--cq` 基准模式（config 键 `fixed_cq`，旧 config 缺该键 = false，行为不变）。config 与 CLI 默认值全量 diff 为零，`compress_config.json` 只是"生产档位的固化快照"。
+**现状（2026-10-17 起）**：批量默认改为固定 CQ30/36 按像素分流，auto_cq 仅在显式
+`--auto-quality TARGET` 时启用；固定 CQ 与自动标定的选择不再混用。库 API 仍保留 auto_cq。
 
-## 18. 百万级长跑加固（2026-09-06）
+---
 
-动机：单次运行 1M+ 源（10–20 h 量级）时审计发现编码核心无泄漏（会话缓存有界、逐图对象 RAII 释放），
-但编排层有 4 个 O(语料规模) 增长点和长跑特有风险。compress_dir.py 已加固：
+## 18. 百万级长跑加固
 
-- **滑动窗口提交**：一次性 submit 1M 个 task dict + Future 主进程要 ~2–4 GB；改为在飞 ≤ 4×workers
-  的滑动窗口（`wait(FIRST_COMPLETED)` 收割 + 补位），主进程内存与语料规模无关。
-- **流式报表 `<report>.stream.jsonl`**：逐行追加（1 MiB 缓冲），中断/崩溃也留下已完成部分的逐图记录；
-  正常结束时照旧写完整 .json（Ctrl+C 中断时顶层 `"interrupted": true`，且提示重跑续传——
-  `overwrite=false` 下已完成的输出自动跳过）。
-- **采样器内存上界**：>2 万样本后间隔每 2 万翻倍（上限 5 s）——12 h 长跑从 ~21.6 万条降到 ~6 万条。
-- **worker 定期重生**：`max_tasks_per_child=10000`，防慢泄漏/碎片化的保险（当前核心审计干净，属防御性）。
-- **探针并行化**：串行 `Image.open` 头探针 ~1–3 ms/张 = 1M 源先干等 15–50 分钟；改线程池（>64 文件时启用）。
-- 遗留运维注意（非代码）：图库保持子目录结构（NTFS 单目录百万文件变慢）；输出目录加 Defender 排除；
-  8192 级大图 ×8 worker 的显存峰值可能静默 CPU 回退（报表按 `mp_per_s` 离群检测）；auto 模式
-  workers=8 时 capacity=1 会话复用≈0（每图 ~3 次开上下文 ≈240 ms），可试 workers=4 权衡。
-- **Windows 长路径（2026-09-13）**：100k+ 语料 + 深子目录时，未开启系统长路径的机器上
-  `rglob`/写入可能在 >260 字符路径上失败并计入 `failures`（不会中断运行）。规避：注册表开启
-  `LongPathsEnabled`（或 git `core.longpaths=true`），或保持目录层级浅、文件名短。
+单次运行 1M+ 源（10–20 h）时，编码核心无泄漏（会话缓存有界、逐图对象 RAII 释放），编排层已加固：
 
-## 19. 质量评估指标体系速览（2026-09-14）
+- **滑动窗口提交**：在飞 ≤ 4×workers（`wait(FIRST_COMPLETED)` 收割 + 补位），主进程内存与语料规模无关。
+- **流式报表** `<report>.stream.jsonl`：逐行追加，中断/崩溃保留已完成部分；正常结束写完整 `.json`，
+  Ctrl+C 时顶层 `"interrupted": true`，重跑同参数即续传。
+- **采样器内存上界**：>2 万样本后间隔倍增（上限 5 s），避免长跑日志无限增长。
+- **worker 定期重生**：`max_tasks_per_child=10000`，防慢泄漏/碎片化。
+- **探针并行化**：>64 文件时用线程池做 header 探测，避免 1M 源先串行等 15–50 分钟。
+- **续跑指纹**：源/目标绝对路径、续跑版本、有效配置、源大小 + `mtime_ns` 全部匹配才复用
+  `kept_source`；指纹只 stat 不读内容，同大小且 mtime 被还原的变化检测不到，需 `--overwrite`。
+- **Windows 长路径**：未开启系统长路径时，>260 字符路径可能在 `rglob`/写入时失败并计入
+  `failures`（不中断）。开启 `LongPathsEnabled`（或 git `core.longpaths=true`），或保持目录层级浅。
 
-动机：指标方法论此前只写在 OPTIMIZATION_PROPOSALS.md 开头的度量说明与 uvtest/README 的脚本索引里，
-主文档（README/本文件）无索引——想知道"项目用什么指标评判画质"必须翻辅助文档。三层分工：
+---
+
+## 19. 质量评估指标体系速览
+
+本节是**指标口径的唯一事实源**；README、uvtest 脚本和其他文档只链接到这里。
 
 | 层面 | 指标 | 实现/位置 | 用途 |
 |---|---|---|---|
-| 编码闭环（每图自动） | 8×8 块状 SSIM（仅亮度） | `src/lib.rs` `calculate_ssim` | auto_cq 校准到 target 0.88；试编码固定 512×512 |
+| 编码闭环（每图自动） | 8×8 块状 SSIM（仅亮度） | `src/lib.rs` `calculate_ssim` | auto_cq 校准到 `target_quality`（0–100，默认 80 → SSIM 0.98；≤1 直接当 SSIM）；试编码固定 512×512 |
 | 感知评估（人工跑） | LPIPS（alex, torch）；ΔE2000 worst-1% 仅色度专项辅助 | `uvtest/compare_perceptual.py`、`compare_runs.py` | 最终裁判 = LPIPS + 人工核验 |
-| 回归报警（自动） | SSIM（含最差块数值/坐标）/ PSNR / alpha MAE（含 worst-1%） | `uvtest/quality_metrics.py`、`cargo test` | 同路径回归比较，不做观感预测 |
+| 回归报警（自动） | SSIM（含最差块数值/坐标）/ PSNR / alpha MAE（含 worst-1%）/ chroma PSNR | `uvtest/quality_metrics.py`、`cargo test` | 同路径回归比较，不做观感预测 |
 
-要点（完整方法论见 OPTIMIZATION_PROPOSALS.md 开头"度量方法说明"）：
+规则：
 
-- 分块 SSIM 对高频/硬边缘**偏保守**，只当回归检测器，不当观感预测器；"看起来一样吗"这类问题以
-  LPIPS 为准（<0.05 ≈ 不可辨）。（此前记的"实测 SSIM 0.925 的图人工不可辨"成因已于 2026-10-14 更正：
-  那个 0.925 来自未合成白底的口径，见下条与 OPTIMIZATION_PROPOSALS 方案 P 修订。）
-- **ΔE2000 不是独立判断依据**：简化实现（hue-mean）仅作同路径内相对比较；`compare_runs.py` 默认关闭
-  （最贵指标 ~3-6× LPIPS，LPIPS 已覆盖观感结论），仅在专项排查 4:2:0 色度渗色时开启。
-- RGBA 算任何指标前必须**先合成到背景色**，否则透明像素下方无意义的 RGB 会污染数值。
-- LPIPS 数值仅在同一网络（alex）、同类失真间可比；torch 为 CPU 版，`compare_runs.py` 的
-  感知子集限 ≤4MP 源。ΔE2000 的 hue-mean 为简化实现（色度 PSNR 已于 2026-10-14 换成标准 BT.709 矩阵），仅限同一路径内相对比较。
-- VMAF 未使用（视频向指标，需 libvmaf），图片场景由 LPIPS 承担该角色。
-- **指标精度升级（2026-10-14，方案 O）**：色度 PSNR 换成标准 BT.709 RGB→YCbCr 矩阵；
-  `alpha_mae_worst1()` 补上了全图均值掩盖的边缘误差（`compare_perceptual.py` / `compare_runs.py` 并列输出）；
-  分块 SSIM 经 `ssim_block_stats()` 返回最差块数值与坐标，`compare_runs.py` 的 worst-5 行打印源像素坐标。
-  mean 类数值算法未变，历史报表仍可比；仅 chroma PSNR 数值口径变化（无归档结论引用它）。
-- **合成口径修正（2026-10-14，与上条同批暴露）**：`compare_runs.py` 此前把 RGBA 直接丢 alpha 转 RGB 喂进
-  分块 SSIM，违反"RGBA 先合成背景色"这条规则本身——全透明区块的 RGB 是编码器自由写入的字节，实测最差块
-  SSIM **-0.26**、源对输出均值 0.9997 被拉到 0.8844。现改为先合成白底，全量 55 张的 AVIF/WebP 均值由
-  0.9898/0.9895 变为 **0.9972/0.9969**，最差图从透明 12MP 图变成硬边缘照片（0.991，最差块 0.97）。
-  相对结论不变，但方案 P 里"最差 5 张是真透明图、属分块 SSIM 保守性"的归因作废。
-  `compare_transparent.py` 已同批修正（透明集 WebP 颜色 SSIM 0.925~0.997 → **0.997~0.9996**，AVIF 的"结构性优势"作废，见 OPTIMIZATION_PROPOSALS I4）；`compare_oversize.py` 两侧都先展平成 RGB、口径自洽，不透明/JPEG 语料不受影响，保持不动。
+- 分块 SSIM 对高频/硬边缘**偏保守**，只当回归检测器；“看起来一样吗”以 LPIPS 为准（<0.05 ≈ 不可辨）。
+- **ΔE2000 不是独立判断依据**：hue-mean 为简化实现，仅作同路径内相对比较；`compare_runs.py`
+  默认关闭（成本约 3–6× LPIPS），仅在专项排查 4:2:0 色度渗色时开启。
+- RGBA 算任何指标前必须**先合成到背景色**（当前统一白底）。不合成会把透明像素下方的无意义 RGB
+  算进指标；曾导致最差块 SSIM -0.26、均值被从 0.9972 拉到 0.9898。
+- LPIPS 数值仅在同一网络（alex）、同类失真间可比；torch 为 CPU 版，感知子集限 ≤4 MP 源。
+- chroma PSNR 使用标准 BT.709 RGB→YCbCr 矩阵；alpha 同时报告 mean 与 worst-1%；
+  分块 SSIM 报告最差块数值/坐标。mean 类数值算法未变，历史报表仍可比；仅 chroma PSNR 口径变化。
+- VMAF 未使用（视频向指标，需 libvmaf），图片场景由 LPIPS 承担。
+- **测量纪律**：不要跨会话 A/B（同一份代码不同天可差 60 ms/张，比多数优化收益还大）；
+  必须同 wheel、同会话、背靠背，必要时用临时环境开关切旧路径。判定格式/路由用墙钟与 Σ任务时间，
+  不要用单图中位数（WebP 分布右偏，中位数会给出反向结论）。小样本画质结论容易翻转，能全跑就全跑。
 
-## 20. AVIF EXIF 透传与文件时间保持（2026-10-14）
+---
 
-动机：`compress_dir.py` 的 AVIF 路由此前丢弃源 EXIF，输出的访问/修改/创建时间也被编码重写成"现在"。
-两条在 2026-10-14 一并补上。
+## 20. AVIF EXIF 透传与文件时间保持
 
-**EXIF（PARITY_MATRIX M5：由"不透传"改为"透传"）**
+### 20.1 EXIF
 
-- 载荷格式是硬约束：HEIF 的 Exif item 载荷 = **4 字节大端 TIFF 头偏移 + TIFF**，不是 JPEG/WebP 的
-  `b"Exif\0\0" + TIFF`。`avif-serialize` 的 `set_exif` 原样写入；libavif 遇到畸形 item 会以
-  **"Invalid Exif payload" 拒绝整个文件**（Pillow 连打开都失败），所以宁可丢弃，也不能塞错。
-- 两处实现：
-  - `uvtest/compress_dir.py::_source_exif_bytes(path)`：读源 EXIF（只读头），去掉 Orientation（像素已物理
-    转正），剥掉 `Exif\0\0` 前缀，补齐 4 字节偏移；布局无法识别则返回 None（无 EXIF 优于打不开）。
-  - `source/nvavif_py/__init__.py::_normalize_exif_payload()`：库层同一归一化，`encode_file` 在调 Rust 前调用。
-    像素经 `exif_transpose` 的输入（PIL/路径/字节）丢弃 Orientation；numpy 输入不转正，保留原标签。
-    已归一化的载荷幂等通过。
-- 实测：载荷 94B（`\x00\x00\x00\x00` + `MM\x00*`），libavif/Pillow 读回 Make/Model/DateTime，Orientation 缺席；
-  像素只转正一次；无 EXIF 源为 no-op；`_source_exif_bytes` 在 26.8MB JPEG 上 ~1.1 ms/次。
-- ⚠️ 库层修复已进**源码**，但 `.venv` 装的是**预构建 wheel**（`pyproject.toml` 明示 venv 不从源码装，
-  见第 5 节安装布局）。因此 `encode_file(exif=...)` / Pillow 插件 `img.save(..., "AVIF")` 的修复要
-  **重建 wheel 后才在 venv 生效**；修复前这两条路把 JPEG 帧原样写入，产出**打不开**的 AVIF。
-  `compress_dir.py` 自带载荷构建，不受该 wheel 状态影响。
-- ⚠️ 回读校验的坑：Pillow 的 AVIF 解码会把报出的 Orientation 归一化成 **1**（libavif 行为），
-  即便文件里原样存着 6。所以校验"编码是否保留 Orientation"必须查**文件字节**，不能信 `getexif()`。
-  （已按此复验：`encode_file(np_array, exif=<Orientation=6>)` 的输出文件里就是 `…0006`；库层逐字节原样写入。）
+HEIF 的 Exif item 载荷 = **4 字节大端 TIFF 头偏移 + TIFF**，不是 JPEG/WebP 的
+`b"Exif\0\0" + TIFF`。`avif-serialize` 原样写入；libavif 遇到畸形 item 会以
+“Invalid Exif payload” 拒绝整个文件，所以布局无法识别时宁可丢弃。
 
-**文件时间（PARITY_MATRIX F9，新增）**
+- 库层 `_normalize_exif_payload()` 在调 Rust 前统一：剥 JPEG/WebP 前缀、补 4 字节偏移；
+  经 `exif_transpose` 的输入去 Orientation；numpy 输入不转正、保留原标签。幂等。
+- 批处理 `_source_exif_bytes()` 只读源头，做同样归一化；畸形返回 None。
+- 回读校验要查**文件字节**：Pillow 的 AVIF 解码会把 Orientation 归一化成 1，不能信 `getexif()`。
 
-- 编码输出的 mtime 用 `os.utime` 继承源文件；Windows 上创建时间另需 `SetFileTime`
-  （`CreateFileW` 以 `FILE_WRITE_ATTRIBUTES` 打开，FILETIME = 自 1601 起的 100ns 计数，偏移 11644473600 s）。
-  源 `st_ctime` 在写盘前捕获，in-place 时也早于删源；WebP/PNG/AVIF 各路由一致。
-- atime 也一并写入，但**无实际保持意义**：本文件系统读文件即刷新 atime，而源在编码前必被读取
-  （头探测 + 编码），worker 取 `src_stat` 时源 atime 已是编码时刻——所以输出 atime ≈ 编码时刻。
-  真正被恢复的是 mtime 与创建时间（实测 atime 保持均失败、mtime/creation 保持均通过）。
+**元数据承载**：WebP/PNG 透传 EXIF + ICC + XMP（WebP 走 `xmp=`，PNG 走 Adobe iTXt
+`XML:com.adobe.xmp`）；AVIF 只能带 EXIF（avif-serialize 只暴露 `set_exif`），ICC/XMP 缺失时
+逐图写入 `dropped_meta`。`photoshop`(IPTC)/`adobe`/`dpi` 各路由都不传。
 
-**元数据承载台账（PARITY_MATRIX M10，2026-10-14 同批）**
+### 20.2 文件时间
 
-- 先量后补：扫 `test_imgs` 的信息键，源普遍带 `exif / icc_profile / xmp / photoshop / adobe / dpi`。
-  - **EXIF 已不丢**：含 GPS + Exif 子 IFD 的 EXIF 过 `_source_exif_bytes` 后全部读回，仅刻意去 Orientation。
-  - WebP/PNG 路由补上 **XMP**（此前只传 EXIF+ICC）：WebP 走 `xmp=` 参数，PNG 走 Adobe iTXt 块
-    `XML:com.adobe.xmp`（`PngImagePlugin` 无 `xmp=` 关键字）。实测 WebP/PNG 输出三件套全读回。
-  - AVIF 路由装不下 ICC/XMP（avif-serialize 0.8.8 只有 `set_exif`），像素已转 sRGB——不再静默，
-    逐图在 report 行记 `dropped_meta: ["icc_profile","xmp"]`（无缺失则无此键）。
-- 未处理的仍丢：`photoshop`(IPTC)/`adobe`/`dpi` 各路由都不传；如需保留另立工作项。
-- 未做 per-image 旁路文件（污染图库目录、被递归扫描当输入、输出计数翻倍）；也未引 YAML——沿用
-  已有的 `--report`（JSON + `.stream.jsonl`）当唯一清单，位于目标根目录。
+输出 mtime 用 `os.utime` 继承源；Windows 创建时间另需 `SetFileTime`
+（`CreateFileW` + `FILE_WRITE_ATTRIBUTES`；FILETIME = 1601 起的 100 ns 计数）。源 stat 在写盘前
+捕获，in-place 时早于删源；WebP/PNG/AVIF 各路由一致。atime 也会写入，但没有保持意义：源在编码前
+必被读取，输出 atime ≈ 编码时刻。真正恢复的是 mtime 与创建时间。
+
+> 库层修复需要重建 wheel 才在 `.venv` 生效：venv 装的是预构建 wheel，不从源码装（§5.1）。
+> 批处理自带载荷构建，不受 wheel 状态影响。
+
+---
+
+## 21. 路由速度对比与默认阈值
+
+**工具**：`uvtest/bench_opaque_formats.py --fixed-cq`，走真实 `_encode_task`（解码 + 预处理 +
+编码 + 落盘），排除 alpha/动图/超尺寸源，按 avif→webp→webp→avif 交替抵消漂移。
+
+53 张不透明源、533 MP、8 worker、固定 CQ20（历史对比）：
+
+| 格式 | 墙钟 | Σ任务时间 | 输出 |
+|---|---:|---:|---:|
+| AVIF | 3.53–3.58 s | 24.4–24.8 s | 98.4 MB |
+| WebP q90/m2 | 3.48–3.50 s | 25.2–25.3 s | 62.3 MB |
+
+总计打平（1.02×），但逐图配对后分桶差异很大：
+
+| 图幅 | webp/avif | 结论 |
+|---|---:|---|
+| <8 MP | 0.24 | WebP 快 4.2× |
+| ≥8 MP | 1.36 | AVIF 快 1.36× |
+
+### 21.1 上下文命中后的重测
+
+这是 **AVIF 全 miss** 时的交点（8 MP）。命中 NVENC context 后，用 `--same-size` 直接测命中成本：
+1.23 MP 14.8 ms、1.75 MP 33.8 ms、2.39 MP 32.1 ms、3.47 MP 38.2 ms、3.48 MP 68.0 ms；
+miss 的 evict+open 随分辨率上升（2.39 MP 约 267 ms、3.5 MP 约 330–360 ms），不是常数。
+
+按各桶真实命中下限重算期望成本：1.23 MP AVIF 慢 1.3×；1.75 MP 略慢；2.39 MP 起 AVIF 快
+1.40–1.75×。**交叉点落在 1.75–2.39 MP，默认阈值取 2 MP**（保守取整）。4–8 MP 本语料无样本，
+速度/体积都夹在相邻桶之间，随阈值走 AVIF。
+
+**默认 CQ（2026-10-17 决定）**：>8 MP 用 `--cq 30`；≤8 MP（实际是 2–8 MP）用 `--mid-cq 36`。
+相对 WebP Q90 的体积：CQ30 1.30–1.32×（8–32 MP），CQ36 1.06–1.13×（2–16 MP）。
+CQ36 在 16–32 MP 只有 2/11 张 LPIPS 优于 WebP，故大图不降档。`--auto-quality` 启用时两者都不生效。
+
+注意：
+
+- 交点随内容漂移（libwebp 对内容比 NVENC 敏感），所以是**默认策略**而非物理常数。
+- 这批对比只谈速度；CQ20/CQ30/CQ36 与 WebP Q90 不是对齐质量，字节差不能单独当画质判定。
+- 判定用墙钟/Σ任务时间，不用单图中位数：WebP 分布右偏，中位数落在小图那半边，会得出“WebP 快 2.3×”的反向结论。
+
+### 21.2 WebP method 策略（2026-10-17）
+
+method≥3 在大图上触发穷举划分搜索：73.jpg（8736×11648）42 s vs method=2 的 2.3 s，输出只小 10%。
+因此只对 oversize（>8192）封顶 `min(请求值, 2)`；≤8192 的透明/不透明路由保留请求值（默认 4）。
+
+全批 A/B（test_imgs 79 张，method 2 vs 4）：墙钟 6.1–7.0 s vs 6.6–6.8 s（噪声内），输出
+92.9 vs 92.7 MB；透明 WebP 路由 10.17 → 10.02 MB（−1.5%）。隔离编码测得 method 4 的 libwebp
+CPU 工时约为 method 2 的 1.9×（透明）/2.7×（不透明 ≤2 MP），但混合图库中被 AVIF 任务并行吸收，
+未体现为墙钟差异。
+
+---
+
+## 22. 底层加速现状
+
+| 组件 | 是否多线程/加速 | 依据 |
+|---|---|---|
+| NVENC（AVIF 颜色流） | 硬件加速 | `av1_nvenc` |
+| rav1e（alpha、CPU 颜色回退） | 多线程 | `NVAVIF_RAV1E_THREADS`，批量按 cores/workers 下发 |
+| 进程池 | 8 进程并行 | `default_workers = min(8, cpu_count//2)` |
+| libwebp 编码 | 单线程 | `PIL._webp` 只暴露 `WebPEncode`，无 `thread_level` |
+| libjpeg-turbo 解码 | 单线程 | Pillow 不走 TurboJPEG 的 MT API |
+| lcms 色彩转换 | 单线程 | ImageCms 无并行入口 |
+
+**加进程已到顶**：同一批 53 张、8 vs 20 worker，墙钟 3.70–3.76 s → 3.01 s（1.24×），
+但 Σ任务时间反而 +32%。本机 20 核 28 线程（8P + 12E）、L3 仅 33 MB；单张 24 MP 的 RGB 缓冲
+72 MB，早已冲掉 L3，多进程只是撞同一堵内存带宽墙。默认 8 worker 恰好铺满 8 个 P 核。
+
+跑批期间 CPU 约 24–37%，NVENC 编码引擎 44–79%（从未打满），AVIF 轮并行效率约 88%，
+与 WebP 轮 91% 同级。**瓶颈在 CPU 侧（解码与内存带宽），不在 GPU**。
+
+**解码地板**：同尺寸只改 JPEG 质量重存，q=95 53.8 ms、q=75 35.5 ms、q=50 32.0 ms、
+q=25 30.1 ms——曲线在 ~30 ms 见底，是缓冲区分配 + 逐像素拷贝的地板。16 MP 源 `draft()` 到
+1/2、1/4、1/8，耗时 117/111/97 ms vs 满尺寸 135 ms：输出像素少 64× 只快 28%，说明成本在
+熵解码而非 IDCT/上采样。文件 I/O 不是因素（裸读 4.2 ms；内存解码 129.2 vs 磁盘 133.4 ms）。
+
+换解码器也没有收益：NVDEC `mjpeg_cuvid` 在 3 张源里 2 张失败，唯一成功的一张墙钟与 CPU 持平；
+libwebp 多线程（`-threads 1/4/8`）在 method=2 下不提速。progressive JPEG 明显更慢
+（同 1.4 MB，基线 35.5 ms vs 渐进式 85.8 ms）。唯一未证伪的缺口是 nvJPEG，但需要自建绑定且
+会绕过 PIL 的 ICC/方向处理、改变输出像素，不承诺收益。
+
+---
+
+## 23. 全库规模投影（外部索引抽样回放，2026-10-17）
+
+不是实跑全库，而是从用户提供的 Everything 索引抽样估算。口径写清，避免以后当成实测引用。
+
+**数据源**：外部索引共 10,514,415 行，其中图片 2,908,967 个、合计 4097.5 GB（4.10 TB）。
+
+**方法**：按 `图幅桶 × 扩展名` 从索引聚合总量，每格抽 30 个真实文件（bmp/tif 10，
+oversize jpg/jpeg 20），共 640 个样本；应用与批处理一致的扫描期过滤后，以 8 进程池
+回放 `_encode_task`（`NVAVIF_CTX_CACHE=1`），比例按字节加权。样本为随机抽样，
+比例用 bootstrap 给区间。
+
+**投影结果**（当前默认路由 + CQ30/CQ36）：
+
+| 桶 | 输入 | 输出 | 比例 | 编码墙钟 |
+|---|---:|---:|---:|---:|
+| >8 MP | 2141.6 GB | 1129.8 GB | 1.90× | 8.5 h |
+| 2–8 MP | 993.7 GB | 305.4 GB | 3.25× | 7.0 h |
+| ≤2 MP | 438.8 GB | 186.5 GB | 2.35× | 3.8 h |
+| oversize（>8192） | 414.2 GB | 99.7 GB | 4.15× | 3.6 h |
+| no-dims | 1.9 GB | 1.5 GB | 1.30× | ~0 |
+| gif（原样拷贝） | 105.5 GB | 105.5 GB | 1.00× | 0 |
+| below-min（<130×66，拷贝） | 1.7 GB | 1.7 GB | 1.00× | 0 |
+| **合计** | **4097.5 GB** | **1830.0 GB** | **2.24×** | **23.0 h** |
+
+只算实际参与编码的 3.99 TB 是 2.32×。整体比例的 bootstrap 95% 区间 **1.98–2.47**，
+节省约 **2.27 TB**。
+
+**为什么只有 2.24×**：大头是已经是有损的 JPEG——占输入字节 71%（2.92 TB → 1.49 TB，
+1.96×），并占输出了 81%。PNG 0.94 TB → 0.13 TB（7.1×）虽然高，但基数小；WebP 源经
+keep-smaller 基本保持 1.0×；GIF 0.105 TB 原样拷贝。>8 MP 的 JPEG 桶单独就有 1.76 TB、
+仅 1.69×，它决定了总比例的上限。
+
+**耗时口径**：任务工时 167.5 h ÷ 实测有效并行 7.30× = **23.0 h**（bootstrap 21.5–24.4 h，
+8 worker）。**不含**全目录头部探测/扫描、copy-skipped 的 I/O、以及索引本身的读取时间；
+真实端到端应另加这部分。
+
+注意：
+
+- 640 个样本的字节加权投影，内容分布与索引一致但仍是抽样；区间已给，不要当精确值。
+- 比例是体积口径，不是画质判定；默认 CQ 的画质结论仍由用户人工比对。

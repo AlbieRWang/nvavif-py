@@ -56,17 +56,6 @@ The built-in CPU path (`rav1e`) is **also multi-threaded** and works on any mach
 
 This makes `nvavif_py` ideal for workloads where **throughput matters more than squeezing out the last byte of compression**, while remaining fully functional everywhere.
 
-### Decoding Performance
-
-| Metric            | Standard Pillow          | **nvavif_py.decode_file()** |
-|-------------------|--------------------------|-----------------------------|
-| Decode time       | 320ms (5184×3456px AVIF) | **~80ms**                   |
-| Decode speed      | 1×                       | **4×**                      |
-| Memory copies     | 3+ (codec → PIL → NumPy) | **1 (codec → NumPy)**       |
-| YUV→RGB math      | Float (`swscale`)        | **Fixed-point (bit-shift)** |
-| CPU vectorization | Partial                  | **Full (AVX2/NEON)**        |
-| ML/AI ready       | No (slow)                | **Yes (optimized)**         |
-
 ---
 
 ## Hardware Requirements
@@ -218,6 +207,29 @@ img.save("photo.avif", cq=20, device=Device.CPU)
 
 ---
 
+## Batch Compression (recommended entry point)
+
+For a folder of images, use the bundled batch tool instead of looping over
+`encode_file()` yourself:
+
+```bash
+uv run python uvtest/compress_dir.py --src path/to/images --dst path/to/output
+```
+
+Current defaults (the exact routing table is in [`PARITY_MATRIX.md`](PARITY_MATRIX.md)):
+
+- opaque images ≤ 2 MP → WebP Q90; 2–8 MP → GPU AVIF CQ36; > 8 MP → GPU AVIF CQ30
+- real transparency → WebP Q90 (lossless for sources ≤ 1 MB)
+- sources beyond the 8192 NVENC cap → WebP Q80, resized to ≤ 16383 when needed (larger sources are kept as-is)
+- JPEG sources estimated below IJG quality 85 are kept as-is
+- `--keep-smaller` and `--copy-skipped` are on; the source directory structure is mirrored
+- process pool defaults to `min(8, cores/2)`; per-image results go to `compress_report.json`
+
+Run `--help` for the full flag list, `--write-config` for a config template, and
+[`uvtest/README.md`](uvtest/README.md) for the test/benchmark script index.
+
+---
+
 ## API Reference
 
 ### `is_supported() → bool`
@@ -308,6 +320,8 @@ When the input is a PIL Image or a file path/bytes, the following preprocessing 
 | **11–18** | Visually indistinguishable from the original.   |
 | **20–30** | High efficiency — **optimal for web delivery**. |
 | **31–51** | Aggressive compression.                         |
+
+> The library API clamps `cq` to 0–51 (NVENC maps 0 to 1). The batch tool uses CQ36 for opaque AVIF up to 8 MP and CQ30 above; ≤ 2 MP opaque images go to WebP by default.
 
 > **Note:** NVENC requires image dimensions to be **even numbers**.
 > 
@@ -881,28 +895,18 @@ nvavif_py.encode_file("photo.png", cq=20, device=Device.CPU)   # explicit CPU
 
 ## Quality Metrics
 
-- **Closed-loop, per image (automatic):** a fast block-wise SSIM (8×8 blocks, luma only, implemented in `src/lib.rs`) drives auto_cq — the encoder picks the CQ that hits the SSIM target (default 0.88) measured on a 512×512 trial encode.
+- **Closed-loop, per image (automatic):** a fast block-wise SSIM (8×8 blocks, luma only, implemented in `src/lib.rs`) drives auto_cq — the encoder picks the CQ that hits `target_quality` (0–100, default 80 → SSIM 0.98; values ≤ 1 are used as SSIM directly) measured on a 512×512 trial encode. auto_cq is opt-in (`auto_cq=True` or the batch `--auto-quality`).
 - **Perceptual verdicts (manual comparison runs):** LPIPS (alex) in `uvtest/compare_perceptual.py` and `uvtest/compare_runs.py` — format and configuration trade-offs are judged on LPIPS plus human spot-checks, with RGBA inputs composited over white first. ΔE2000 worst-1% is an opt-in auxiliary (`--de2000`, off by default) used only when hunting 4:2:0 chroma fringing — not a standalone verdict. Needs the optional `lpips` dependency (torch; CPU build is fine, the perceptual subset is capped at ~4 MP sources).
 - **Regression alarms (automated):** SSIM / PSNR / alpha-MAE helpers in `uvtest/quality_metrics.py` and the `cargo test` suite.
 
-Block SSIM is deliberately conservative on hard edges: images at SSIM ~0.925 are usually visually indistinguishable (LPIPS 0.003–0.005, where <0.05 ≈ indistinguishable), so use LPIPS — not SSIM — to answer "does it look the same". Methodology details: `DEVELOPMENT_NOTES.md` §19 and the measurement note atop `OPTIMIZATION_PROPOSALS.md`.
+Block SSIM is deliberately conservative on hard edges: images at SSIM ~0.925 are usually visually indistinguishable (LPIPS 0.003–0.005, where <0.05 ≈ indistinguishable), so use LPIPS — not SSIM — to answer "does it look the same". Methodology details: `DEVELOPMENT_NOTES.md` §19.
 
 ---
 
 ## Use Cases
 
 ### 🧠 ML/AI Training Pipelines
-Compress dataset images or model output visualizations on-the-fly using GPU resources that would otherwise sit idle during data preprocessing.
-Encode with GPU, decode with `dav1d` — both operations leave the GIL free for DataLoader parallelism.
-
-Use AVIF datasets to reduce storage and disk I/O by 30–70% **without sacrificing training speed**. `nvavif_py.decode_file()` is optimized for DataLoader workflows — configure `threads=1` per worker to avoid CPU contention, and enjoy faster-than-PNG decoding due to smaller file sizes. Perfect for ImageNet-scale datasets, satellite imagery, medical imaging, and generative AI training data.
-
-**Why AVIF for training?**
-- **Smaller datasets** → Faster download, less cloud storage cost.
-- **Faster disk I/O** → Smaller files = less time reading from SSD/NVMe.
-- **No quality loss** → Visually lossless at CQ 12–18.
-- **Decode speed** → nvavif_py is 3–4× faster than Pillow, matching or exceeding PNG decode times.
-- **CPU-only environments** → The built-in rav1e encoder covers dataset preparation even without a GPU.
+Encode datasets with GPU NVENC and decode with `dav1d`; both release the GIL, so DataLoader workers stay parallel. Use `threads=1–2` per worker to avoid CPU contention. A ready-to-use `Dataset` example is in [Ideal for ML/AI Training Pipelines](#ideal-for-mlai-training-pipelines).
 
 ### 🗄️ Storage Optimization
 Reduce cloud storage costs by converting image libraries from legacy formats to AVIF, achieving 30–70% storage savings.
