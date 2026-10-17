@@ -1,22 +1,25 @@
-"""One-command batch compression: compress a folder of images to AVIF.
+"""One-command batch compression: pixel-based WebP/GPU AVIF routing.
+
+Default: opaque images <=2 MP use WebP; larger ones use GPU AVIF (CQ36 up to
+8 MP, CQ30 above).
+--opaque-format avif/webp overrides automatic routing.
+--auto-quality TARGET explicitly enables AVIF quality calibration.
+Known slow AVIF paths are skipped; no CPU AVIF fallback is allowed.
 
 Wraps nvavif_py.encode_file for every image in the source directory.
 Input formats are whatever Pillow opens (PNG/JPEG/WebP/BMP/TIFF/GIF).
 By default, truly transparent images are routed to whole-image WebP
-(lossless alpha, no rav1e involved); opaque images go to AVIF on the GPU.
+(lossless alpha, no rav1e involved); opaque images follow the pixel threshold.
 
 Images are encoded by a process pool: each worker gets its own NVENC
-session, so GPU color encodes of different images overlap, and CPU alpha
-encodes overlap with GPU color encodes of other images. The worker count
+session, so GPU color encodes and CPU WebP tasks can overlap. The worker count
 is capped by the driver's concurrent-NVENC-session limit (~8 on RTX 40
 series); oversized (>8192) images never take the GPU anyway. Each worker
 keeps its NVENC encoder contexts open across images (LRU sized so that
 workers x capacity stays within the driver session budget), which removes
 the ~80 ms context-open cost per encode (measured 2026-09-06; ~75% of
 per-image wall time at 512x512). Jobs are submitted slowest-first
-(header-probe cost estimate), and each worker's rav1e contexts are
-thread-capped so parallel CPU encodes do not thrash (alpha: cores/workers,
-oversize color fallback: cores/oversize-jobs).
+(header-probe cost estimate). CPU AVIF paths are skipped.
 
 Very large runs (100k+ sources) keep the orchestration flat-memory: header
 probes run in a thread pool, at most 4xworkers tasks are in flight (no
@@ -27,7 +30,7 @@ pool workers are recycled every 10000 tasks. An interrupted run still
 writes the .json report, marked "interrupted": true.
 
 Usage (from the repo root, single root .venv):
-    uv run python uvtest/compress_dir.py                       # test_imgs -> out/compressed, auto quality 88
+    uv run python uvtest/compress_dir.py                       # test_imgs -> out/compressed, auto routing (CQ36/CQ30)
                                                                # (bare-run defaults == compress_config.json)
     uv run python uvtest/compress_dir.py --src DIR --dst DIR   # custom folders
     uv run python uvtest/compress_dir.py --auto-quality 85     # different SSIM target
@@ -44,18 +47,17 @@ a template with the current effective values:
     uv run python uvtest/compress_dir.py --write-config my_config.json
 
 Routing rules (all tunable):
-    opaque              -> GPU AVIF (NVENC), keep-smaller guard; or whole-
-                           image WebP with --opaque-format webp
+    opaque              -> <=2 MP WebP, otherwise GPU AVIF (CQ36 for <=8 MP,
+                           CQ30 above); --opaque-format avif/webp overrides
     truly transparent   -> whole-image WebP q90 (--transparent-format,
                            --webp-quality); sources <= --webp-lossless-max-mb
                            (default 1 MB) use LOSSLESS WebP (same size as
                            lossy on simple graphics, zero fidelity loss)
     oversized > 8192    -> whole-image WebP q80 method 2 (--oversize-format,
                            ~5.9x faster than the rav1e fallback); >16383
-                           (WebP limit) or --oversize-format avif take the
-                           AVIF CPU fallback, unless --oversize-max-edge
-                           resizes the source to fit first (opt-in LANCZOS,
-                           per-image resize recorded in the report)
+                           (WebP limit) is resized by --oversize-max-edge
+                           (default 16383); if still too large or explicitly
+                           routed to AVIF, skip and retain the source
     low-quality JPEGs   -> kept as-is (--min-jpeg-quality)
 
 Unchanged sources (kept by --keep-smaller, pre-filtered JPEGs, failures) are
@@ -83,6 +85,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import sys
@@ -130,6 +133,11 @@ NVENC_MAX_DIMENSION = 8192
 # batch tool skips them outright instead of force-compat-ing the slow path.
 NVENC_MIN_WIDTH = 130
 NVENC_MIN_HEIGHT = 66
+
+# Upper edge of the AVIF mid band. The 2-8 MP band only became AVIF after the
+# context-hit re-measurement (DEVELOPMENT_NOTES §21.1); it uses --mid-cq so the
+# format switch stays size-neutral, while larger sources keep --cq.
+MID_AVIF_MAX_MP = 8.0
 
 # WebP format limit (Pillow raises above this).
 WEBP_MAX_DIMENSION = 16383
@@ -342,6 +350,12 @@ def _encode_task(task: dict) -> dict:
     src_stat = path.stat()
     src_bytes = src_stat.st_size
 
+    def skip_slow(reason):
+        if task["copy_skipped"] and not in_place:
+            shutil.copy2(path, out_dir / path.name)
+        return {"ok": True, "row": {"name": display_name, "action": "skipped_slow",
+                "reason": reason, "src_bytes": src_bytes}}
+
     # Whole-image WebP routing covers two cases: (a) transparent images when
     # --transparent-format is webp/png (WebP codes alpha losslessly and keeps
     # the entire encode off the CPU rav1e alpha path), and (b) oversized
@@ -365,20 +379,26 @@ def _encode_task(task: dict) -> dict:
         width = max(1, int(orig_width * scale))
         height = max(1, int(orig_height * scale))
     webp_fits = max(width, height) <= WEBP_MAX_DIMENSION
+    if not orig_width or not orig_height:
+        return skip_slow("unknown_dimensions")
+    if oversize and (not webp_fits or task["oversize_format"] == "avif"):
+        return skip_slow("oversize_no_fast_route")
     whole_format = None  # "webp" | "png": whole-image routing, no AVIF at all
     quality = None
     lossless = False
     transparent_route = False
+    has_transparency = False
     fmt = task["transparent_format"]
     # Pixel-level transparency check only when the header claims an alpha
     # channel (probe_cost): an opaque-header JPEG/PNG cannot sprout alpha
     # pixels, and the full decode + RGBA convert costs 0.2-0.4 s per 12 MP
     # source for nothing (REVIEW_FINDINGS B1). width == 0 (unreadable
     # header) keeps the old always-check behavior as a fallback.
-    if fmt != "avif" and (task.get("has_alpha") or not task.get("width")):
+    if task.get("has_alpha") or not task.get("width"):
         with Image.open(path) as im:
             alpha_lo, _ = im.convert("RGBA").getchannel("A").getextrema()
-        if alpha_lo < 255 and (fmt == "png" or webp_fits):
+        has_transparency = alpha_lo < 255
+        if has_transparency and fmt != "avif" and (fmt == "png" or webp_fits):
             # real transparency (constant-opaque stays on AVIF); a webp
             # transparent route beyond the 16383 cap falls through to AVIF
             # unless --oversize-max-edge resized it to fit
@@ -393,23 +413,28 @@ def _encode_task(task: dict) -> dict:
             # (--webp-lossless-max-mb) is raised.
             if whole_format == "webp" and task["webp_lossless_max_mb"] > 0 and path.stat().st_size <= task["webp_lossless_max_mb"] * 1e6:
                 lossless = True
-    if whole_format is None and task["oversize_format"] == "webp" and oversize and webp_fits:
+    if whole_format is None and not has_transparency and task["oversize_format"] == "webp" and oversize and webp_fits:
         whole_format = "webp"
         quality = task["oversize_webp_quality"]
 
-    if whole_format is None and task["opaque_format"] == "webp" and not oversize and webp_fits:
-        # Opaque images routed to WebP (experiment/comparison route; the AVIF
-        # NVENC path stays the default). Oversize images are excluded — they
-        # are governed by --oversize-format above.
+    auto_webp = (
+        task["opaque_format"] == "auto"
+        and task["opaque_webp_max_mp"] > 0
+        and width * height <= task["opaque_webp_max_mp"] * 1e6
+    )
+    if whole_format is None and not has_transparency and (task["opaque_format"] == "webp" or auto_webp) and not oversize and webp_fits:
         whole_format = "webp"
         quality = task["opaque_webp_quality"]
 
     if whole_format is not None:
         # method>=3 runs an exhaustive partition search that explodes on some
-        # large-image content (73.jpg: 42 s vs 2.3 s at method=2 for 10%
-        # smaller output) — the oversize route defaults to method=2. The
-        # opaque webp route is GPU-eligible-size, so quality-first method=4.
-        method = task["webp_method"] if (transparent_route or not oversize) else task["oversize_webp_method"]
+        # large-image content (73.jpg, 8736x11648: 42 s vs 2.3 s at method=2
+        # for 10% smaller output), so only the oversize route is capped.
+        # Below 8192 the requested effort is kept: a full-batch A/B measured
+        # method 4 as no slower end-to-end and 1.5% smaller on the
+        # transparent route.
+        requested = task["webp_method"] if (transparent_route or not oversize) else task["oversize_webp_method"]
+        method = min(2, requested) if oversize else requested
         out_path = Path(task["out_path"]).with_suffix(f".{whole_format}")
         with Image.open(path) as im:
             src_exif = im.info.get("exif")
@@ -456,18 +481,16 @@ def _encode_task(task: dict) -> dict:
                 pnginfo = PngImagePlugin.PngInfo()
                 pnginfo.add_itxt("XML:com.adobe.xmp", src_xmp)
                 save_meta["pnginfo"] = pnginfo
-        if in_place:
-            # Write-then-replace via a temp file: a .png/.webp source can
-            # share its name with the output, and a failed encode must
-            # never take the original down with it.
-            tmp_path = out_path.with_name(out_path.stem + ".tmp" + out_path.suffix)
+        tmp_path = out_path.with_name(out_path.name + ".tmp")
+        try:
             if whole_format == "webp":
                 enc_img.save(tmp_path, "WEBP", quality=quality, lossless=lossless, method=method, **save_meta)
             else:
                 enc_img.save(tmp_path, "PNG", **save_meta)
             out_bytes = tmp_path.stat().st_size
             if task["keep_smaller"] and out_bytes >= src_bytes:
-                tmp_path.unlink()
+                if task["copy_skipped"] and not in_place:
+                    shutil.copy2(path, out_path.parent / path.name)
                 return {
                     "ok": True,
                     "row": {
@@ -480,27 +503,10 @@ def _encode_task(task: dict) -> dict:
                     },
                 }
             os.replace(tmp_path, out_path)
-            if path.resolve() != out_path.resolve():
-                path.unlink()
-        else:
-            if whole_format == "webp":
-                enc_img.save(out_path, "WEBP", quality=quality, lossless=lossless, method=method, **save_meta)
-            else:
-                enc_img.save(out_path, "PNG", **save_meta)
-            out_bytes = out_path.stat().st_size
-            if task["keep_smaller"] and out_bytes >= src_bytes:
-                out_path.unlink()
-                return {
-                    "ok": True,
-                    "row": {
-                        "name": display_name,
-                        "action": "kept_source",
-                        "format": whole_format,
-                        "src_bytes": src_bytes,
-                        "avif_bytes": out_bytes,
-                        "encode_s": round(time.perf_counter() - t0, 3),
-                    },
-                }
+        finally:
+            tmp_path.unlink(missing_ok=True)
+        if in_place and path.resolve() != out_path.resolve():
+            path.unlink()
         _copy_file_times(out_path, src_stat)
         elapsed = time.perf_counter() - t0
         return {
@@ -525,7 +531,15 @@ def _encode_task(task: dict) -> dict:
             },
         }
 
-    kwargs = {"device": task["device"], "preset": task["preset"]}
+    slow_reason = (
+        "transparent_avif_cpu_alpha" if has_transparency else
+        "oversize_avif_cpu" if oversize else
+        "cpu_device" if task["device"] == "cpu" else
+        "unknown_dimensions" if not orig_width or not orig_height else None
+    )
+    if slow_reason:
+        return skip_slow(slow_reason)
+    kwargs = {"device": "gpu", "preset": task["preset"]}
     if task["auto_quality"] is not None:
         kwargs.update(auto_cq=True, target_quality=task["auto_quality"])
     else:
@@ -554,7 +568,12 @@ def _encode_task(task: dict) -> dict:
                     "encode_s": round(elapsed, 3),
                 },
         }
-    out_path.write_bytes(data)
+    tmp_path = out_path.with_name(out_path.name + ".tmp")
+    try:
+        tmp_path.write_bytes(data)
+        os.replace(tmp_path, out_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
     _copy_file_times(out_path, src_stat)
 
     with Image.open(path) as im:
@@ -706,13 +725,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="recurse into subfolders and mirror the relative structure in the output folder (default: on; --no-recursive scans only the top level)",
     )
     parser.add_argument("--dst", type=Path, default=ROOT / "uvtest" / "out" / "compressed", help="output folder for .avif files")
-    parser.add_argument("--cq", type=int, default=20, help="fixed quality 0-51, lower is better (default 20); only used with --fixed-cq")
-    parser.add_argument("--auto-quality", type=float, default=88.0, metavar="TARGET", help="auto_cq SSIM target on the 0-100 scale (default: 88, the measured storage/quality sweet spot on mixed galleries); per-image calibrated CQ is recorded in the report")
+    parser.add_argument("--cq", type=int, default=30, help="fixed quality for opaque AVIF above 8 MP, 0-51 (encode_file clamp; 0 maps to 1), lower is better (default 30)")
+    parser.add_argument("--mid-cq", type=int, default=36, help="fixed quality for opaque AVIF up to 8 MP, 0-51; 36 keeps that band size-neutral to WebP Q90 (default 36; lower for more quality, larger files)")
+    parser.add_argument("--auto-quality", type=float, default=None, metavar="TARGET", help="opt in to auto_cq SSIM targeting on the 0-100 scale; per-image calibrated CQ is recorded in the report")
     parser.add_argument(
         "--fixed-cq",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="disable auto-CQ calibration and encode opaque images at the fixed --cq (benchmark mode; default: auto)",
+        default=True,
+        help="use fixed --cq without calibration (default); --auto-quality TARGET opts into calibration",
     )
     parser.add_argument("--device", choices=["auto", "gpu", "cpu"], default="auto")
     parser.add_argument(
@@ -720,7 +740,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         choices=[1, 2, 3, 4, 5, 6, 7],
         default=7,
-        help="NVENC preset 1-7 for the AVIF route (default 7 = best compression; lower is faster but larger. Also slows the rav1e CPU fallback, which inherits this preset)",
+        help="NVENC preset 1-7 for the AVIF route (default 7 = best compression; lower is faster but larger). Batch AVIF has no CPU fallback, so this never selects a rav1e preset",
     )
     parser.add_argument("--workers", type=int, default=None, help="parallel encode processes (default: min(8, cores/2); NVENC session limit is the hard cap)")
     parser.add_argument("--limit", type=int, default=None, help="only process the first N images (smoke test)")
@@ -756,7 +776,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="output format for images with real transparency (default: webp — codes alpha losslessly, keeps the whole image off the CPU rav1e alpha path, and beat AVIF on the hard-edged transparent test set: 3.5 MB/5.0 s vs 6.1 MB/12.3 s). Constant-opaque RGBA stays on the GPU AVIF path either way",
     )
     parser.add_argument("--webp-quality", type=int, default=90, help="WebP quality 0-100 for --transparent-format webp (default: 90)")
-    parser.add_argument("--webp-method", type=int, default=4, help="libwebp effort 0-6 for transparent WebP (default: 4; small images, quality first)")
+    parser.add_argument("--webp-method", type=int, default=4, help="libwebp effort 0-6 for transparent/opaque WebP routes (default: 4; oversize sources are capped at 2)")
     parser.add_argument(
         "--webp-lossless-max-mb",
         type=float,
@@ -768,17 +788,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--oversize-format",
         choices=["avif", "webp"],
         default="webp",
-        help="output format for images beyond the NVENC 8192 cap (default: webp — measured ~5.9x batch speedup and 1/3 the size of the rav1e CPU fallback at SSIM 0.991 vs 0.995, both visually lossless; OPTIMIZATION_PROPOSALS I4). avif keeps the max-fidelity CPU fallback; images beyond the WebP 16383 limit always take the AVIF fallback",
+        help="output format for images beyond the NVENC 8192 cap (default: webp — measured ~5.9x batch speedup and 1/3 the size of the rav1e CPU fallback at SSIM 0.991 vs 0.995, both visually lossless; OPTIMIZATION_PROPOSALS I4). Batch AVIF never falls back to CPU: with avif, or when WebP cannot fit the 16383 limit, the source is skipped and retained (skipped_slow)",
     )
     parser.add_argument("--oversize-webp-quality", type=int, default=80, help="WebP quality 0-100 for --oversize-format webp (default: 80)")
-    parser.add_argument("--oversize-webp-method", type=int, default=2, help="libwebp effort for oversized WebP (default: 2; method>=3 explodes on some content: 42 s vs 2.3 s for 10%% smaller output)")
+    parser.add_argument("--oversize-webp-method", type=int, default=2, help="libwebp effort for oversized WebP (default: 2; effective effort is capped at 2 because method>=3 explodes on some content: 42 s vs 2.3 s for 10%% smaller output)")
     parser.add_argument(
         "--opaque-format",
-        choices=["avif", "webp"],
-        default="avif",
-        help="output format for opaque (incl. constant-opaque RGBA) GPU-eligible images (default: avif — NVENC GPU color encode). webp routes them to whole-image WebP (--opaque-webp-quality, libwebp effort from --webp-method): pure CPU, no GPU involved",
+        choices=["auto", "avif", "webp"],
+        default="auto",
+        help="opaque output: auto uses WebP at or below --opaque-webp-max-mp and GPU AVIF above it (default); avif forces GPU AVIF; webp forces CPU WebP",
     )
-    parser.add_argument("--opaque-webp-quality", type=int, default=90, help="WebP quality 0-100 for --opaque-format webp (default: 90)")
+    parser.add_argument("--opaque-webp-quality", type=int, default=90, help="WebP quality 0-100 for --opaque-format webp/auto (default: 90)")
+    parser.add_argument("--opaque-webp-max-mp", type=float, default=2.0, metavar="MP", help="auto opaque routing uses WebP at or below this pixel count; larger images use AVIF (default: 2 MP, the measured speed crossover with NVENC context hits; 0 disables auto WebP)")
     parser.add_argument(
         "--oversize-max-edge",
         type=int,
@@ -790,13 +811,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--alpha-rav1e-threads",
         type=int,
         default=0,
-        help="rav1e thread cap per worker for CPU alpha encodes (default: 0 = auto, cores/workers)",
+        help="rav1e thread cap per worker (default: 0 = auto, cores/workers); batch AVIF never runs on CPU, so this is retained for config compatibility",
     )
     parser.add_argument(
         "--color-rav1e-threads",
         type=int,
         default=0,
-        help="rav1e thread cap for the CPU color fallback (default: 0 = all cores; measured: capping regresses wall time, OPTIMIZATION_PROPOSALS J)",
+        help="rav1e thread cap for the CPU color fallback (default: 0 = all cores; batch AVIF never runs on CPU, so this is retained for config compatibility)",
     )
     parser.add_argument("--overwrite", action="store_true", help="re-encode even if the output already exists")
     parser.add_argument(
@@ -839,6 +860,63 @@ def effective_config(args: argparse.Namespace) -> dict:
     return {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items() if k not in ("config", "write_config")}
 
 
+def resolve_quality_mode(args, argv, parser):
+    explicit_auto = any(arg == "--auto-quality" or arg.startswith("--auto-quality=") for arg in argv)
+    if explicit_auto and "--fixed-cq" in argv:
+        parser.error("--fixed-cq and --auto-quality are mutually exclusive")
+    if "--fixed-cq" in argv:
+        args.auto_quality = None
+    elif explicit_auto:
+        args.fixed_cq = False
+    elif "--no-fixed-cq" in argv and args.auto_quality is None:
+        args.auto_quality = 88.0
+    elif args.fixed_cq:
+        args.auto_quality = None
+    elif args.auto_quality is None:
+        args.auto_quality = 88.0
+    args.fixed_cq = args.auto_quality is None
+
+
+def resume_config(args: argparse.Namespace) -> dict:
+    ignored = {"src", "dst", "report", "recursive", "limit", "workers", "overwrite",
+               "copy_skipped", "alpha_rav1e_threads", "color_rav1e_threads", "fixed_cq"}
+    return {k: v for k, v in effective_config(args).items() if k not in ignored}
+
+
+def source_fingerprint(path: Path) -> dict:
+    stat = path.stat()
+    return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
+def load_resume_rows(path: Path, src: Path, dst: Path) -> dict:
+    rows = {}
+    context = None
+    try:
+        with path.open(encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                if row.get("stream"):
+                    context = row if (isinstance(row.get("src"), str) and isinstance(row.get("dst"), str)
+                                      and Path(row["src"]).resolve() == src.resolve()
+                                      and Path(row["dst"]).resolve() == dst.resolve()) else None
+                elif context is not None and isinstance(row.get("name"), str):
+                    if row.get("action") in ("kept_source", "skipped_slow", "failed"):
+                        rows[row["name"]] = {"action": row["action"],
+                                             "source_fingerprint": row.get("source_fingerprint"),
+                                             "resume_config": context.get("resume_config"),
+                                             "resume_version": context.get("resume_version")}
+                    else:
+                        rows.pop(row["name"], None)
+    except FileNotFoundError:
+        pass
+    return rows
+
+
 def main() -> None:
     # Redirected stdout/stderr use the locale codec (e.g. cp936 on Chinese
     # Windows); a 100k-source run WILL contain names outside it and a print
@@ -859,14 +937,14 @@ def main() -> None:
     if cfg_args.config is not None:
         apply_config(parser, cfg_args.config)
     args = parser.parse_args(argv)
+    resolve_quality_mode(args, argv, parser)
+    if args.opaque_webp_max_mp < 0 or not math.isfinite(args.opaque_webp_max_mp):
+        parser.error("--opaque-webp-max-mp must be finite and non-negative")
 
     if args.write_config is not None:
         args.write_config.write_text(json.dumps(effective_config(args), indent=1), encoding="utf-8")
         print(f"config template written: {args.write_config}")
         return
-
-    if args.fixed_cq:
-        args.auto_quality = None  # benchmark mode: fixed --cq, no calibration
 
     scan = args.src.rglob("*") if args.recursive else args.src.iterdir()
     files = sorted(p for p in scan if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES)
@@ -880,49 +958,22 @@ def main() -> None:
         args.dst = args.src  # outputs replace the sources in their own folder
     args.dst.mkdir(parents=True, exist_ok=True)
     workers = args.workers or default_workers()
-    workers = min(workers, len(files))
-
-    # Header probes in a thread pool: a serial Image.open pass costs ~1-3 ms
-    # per source — 15-50 minutes of dead time before the first encode at 1M
-    # sources. Threads suffice: the work is I/O + Pillow header parsing.
-    if len(files) > 64:
-        with ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 8) * 4)) as tp:
-            probes = list(tp.map(probe_cost, files, chunksize=64))
-    else:
-        probes = [probe_cost(p) for p in files]
+    workers = max(1, min(workers, len(files), NVENC_SESSION_LIMIT))
 
     tasks = []
+    candidates = []
     skipped_quality: list[dict] = []
     skipped_animated: list[dict] = []
     skipped_small: list[dict] = []
     skipped_prev_kept: list[str] = []
     seen_stems: dict[Path, set] = {}
     out_exts = ("avif", "webp", "png")
-    # Rerun skip (C2): sources the previous run kept as-is (keep-smaller
-    # guard) are already in the output folder — re-encoding them costs a full
-    # decode + encode to reach the same verdict. --overwrite re-encodes them.
-    prev_kept: set[str] = set()
+    current_resume_config = resume_config(args)
+    prev_attempts: dict[str, dict] = {}
     if not args.overwrite and args.report != Path("none"):
         prev_report = args.report if args.report.is_absolute() else args.dst / args.report
         prev_stream = prev_report.parent / (prev_report.stem + ".stream.jsonl")
-        if prev_stream.exists():
-            same_src = True
-            try:
-                for line in prev_stream.read_text(encoding="utf-8", errors="replace").splitlines():
-                    try:
-                        row = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if row.get("stream"):
-                        if row.get("src") != str(args.src):
-                            same_src = False
-                            break
-                    elif row.get("action") == "kept_source" and row.get("name"):
-                        prev_kept.add(row["name"])
-            except OSError:
-                same_src = False
-            if not same_src:
-                prev_kept = set()
+        prev_attempts = load_resume_rows(prev_stream, args.src, args.dst)
     for i, path in enumerate(files, 1):
         rel = path.relative_to(args.src)
         out_dir = args.dst / rel.parent
@@ -935,7 +986,21 @@ def main() -> None:
             stem = f"{path.stem}_{path.suffix.strip('.')}"
         dir_stems.add(stem)
         out_path = out_dir / (stem + ".avif")
-        if not args.overwrite:
+        previous = prev_attempts.get(rel.as_posix())
+        fingerprint = source_fingerprint(path)
+        if (previous is not None and previous.get("action") in ("kept_source", "skipped_slow")
+                and previous.get("resume_version") == 2
+                and previous.get("resume_config") == current_resume_config
+                and previous.get("source_fingerprint") == fingerprint):
+            if args.copy_skipped and not args.in_place:
+                copied_path = out_dir / path.name
+                if not copied_path.exists() or source_fingerprint(copied_path) != fingerprint:
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(path, copied_path)
+            skipped_prev_kept.append(rel.as_posix())
+            print(f"[{i}/{len(files)}] skip (kept as source by previous run): {rel.as_posix()}")
+            continue
+        if not args.overwrite and previous is None:
             # In-place: exclude the source file itself, or a png/webp source
             # would always "already exist" under the output suffix set.
             exists = any(
@@ -945,14 +1010,18 @@ def main() -> None:
             if exists:
                 print(f"[{i}/{len(files)}] skip (exists): {rel.as_posix()}.*")
                 continue
-        if rel.as_posix() in prev_kept:
-            skipped_prev_kept.append(rel.as_posix())
-            print(f"[{i}/{len(files)}] skip (kept as source by previous run): {rel.as_posix()}")
-            continue
+        candidates.append((i, path, rel, out_dir, out_path, fingerprint))
+
+    pending_paths = [entry[1] for entry in candidates]
+    if len(pending_paths) > 64:
+        with ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 8) * 4)) as tp:
+            probes = list(tp.map(probe_cost, pending_paths, chunksize=64))
+    else:
+        probes = [probe_cost(p) for p in pending_paths]
+    for (i, path, rel, out_dir, out_path, fingerprint), probe in zip(candidates, probes):
         # Animated content (GIF — the format is skipped entirely per policy —
         # and animated WebP) is out of scope for the still-image pipeline:
         # whole-image WebP/AVIF would silently flatten it to its first frame.
-        probe = probes[i - 1]
         if probe.get("format") == "GIF" or probe.get("animated"):
             reason = "gif" if probe.get("format") == "GIF" else "animated"
             skipped_animated.append({"name": rel.as_posix(), "reason": reason, "src_bytes": path.stat().st_size})
@@ -969,6 +1038,7 @@ def main() -> None:
         if 0 < pw < NVENC_MIN_WIDTH or 0 < ph < NVENC_MIN_HEIGHT:
             skipped_small.append({"name": rel.as_posix(), "width": pw, "height": ph, "src_bytes": path.stat().st_size})
             if args.copy_skipped and not args.in_place:
+                out_dir.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(path, out_dir / path.name)
             print(f"[{i}/{len(files)}] skip (below NVENC min {NVENC_MIN_WIDTH}x{NVENC_MIN_HEIGHT}): {rel.as_posix()}")
             continue
@@ -984,13 +1054,15 @@ def main() -> None:
                 print(f"[{i}/{len(files)}] skip (source JPEG quality ~{q:.0f} < {args.min_jpeg_quality:.0f}): {rel.as_posix()}")
                 continue
         out_dir.mkdir(parents=True, exist_ok=True)
+        pixels = probe.get("width", 0) * probe.get("height", 0)
         tasks.append(
             {
                 "index": i,
+                "source_fingerprint": fingerprint,
                 "path": str(path),
                 "name": rel.as_posix(),
                 "out_path": str(out_path),
-                "cq": args.cq,
+                "cq": args.mid_cq if 0 < pixels <= MID_AVIF_MAX_MP * 1e6 else args.cq,
                 "auto_quality": args.auto_quality,
                 "device": args.device,
                 "preset": args.preset,
@@ -1003,6 +1075,7 @@ def main() -> None:
                 "webp_lossless_max_mb": args.webp_lossless_max_mb,
                 "opaque_format": args.opaque_format,
                 "opaque_webp_quality": args.opaque_webp_quality,
+                "opaque_webp_max_mp": args.opaque_webp_max_mp,
                 "oversize_format": args.oversize_format,
                 "oversize_webp_quality": args.oversize_webp_quality,
                 "oversize_webp_method": args.oversize_webp_method,
@@ -1014,7 +1087,10 @@ def main() -> None:
     # Longest job first: a cost-ordered submission keeps every worker busy
     # through the tail instead of ending with one worker grinding on the
     # slowest image (CPU-fallback oversize / transparent AVIF encodes).
-    tasks.sort(key=lambda t: t["cost"], reverse=True)
+    # Break cost ties by exact size: equal-megapixel but differently shaped
+    # sources (1080x1920 vs 1440x1440) would otherwise interleave by path and
+    # break each worker's NVENC context-cache run on every such file.
+    tasks.sort(key=lambda t: (t["cost"], t["width"], t["height"]), reverse=True)
 
     # Fair-share rav1e threads for the alpha encodes: many short transparent
     # images across 8 workers would otherwise spin up a full all-cores
@@ -1060,13 +1136,13 @@ def main() -> None:
         if args.report != Path("none"):
             report_path = args.report if args.report.is_absolute() else args.dst / args.report
             stream_path = report_path.parent / (report_path.stem + ".stream.jsonl")
-            # Per-row incremental record: survives a crash/interrupt mid-run
-            # (the .json report is only written at the end). 1 MiB buffering
-            # keeps this to one small append per ~500 rows on disk.
-            stream_f = open(stream_path, "w", encoding="utf-8", buffering=1 << 20)
-            stream_f.write(json.dumps({
-                "stream": True, "src": str(args.src), "dst": str(args.dst),
-                "cq": args.cq, "auto_quality": args.auto_quality,
+            stream_path.parent.mkdir(parents=True, exist_ok=True)
+            # A leading newline isolates a truncated final record from the next run.
+            stream_f = open(stream_path, "a", encoding="utf-8", buffering=1)
+            stream_f.write("\n" + json.dumps({
+                "stream": True, "src": str(args.src.resolve()), "dst": str(args.dst.resolve()),
+                "cq": args.cq, "mid_cq": args.mid_cq, "auto_quality": args.auto_quality,
+                "resume_version": 2, "resume_config": current_resume_config,
             }) + "\n")
         pool = None
         try:
@@ -1099,9 +1175,15 @@ def main() -> None:
                         try:
                             result = future.result()
                             row = result["row"]
+                            row["source_fingerprint"] = task["source_fingerprint"]
                             rows.append(row)
                             if stream_f is not None:
                                 stream_f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                            if row["action"] == "skipped_slow":
+                                kept_source += 1
+                                kept_src_bytes += row["src_bytes"]
+                                print(f"{tag} {row['name']}: skipped slow path ({row['reason']})")
+                                continue
                             if row["action"] == "kept_source":
                                 kept_source += 1
                                 kept_src_bytes += row["src_bytes"]
@@ -1163,7 +1245,7 @@ def main() -> None:
     if skipped_animated:
         print(f"animated: {len(skipped_animated)} GIF/animated-WebP sources skipped (still-image pipeline)")
     if kept_source:
-        print(f"guard: {kept_source} images kept as source (AVIF was not smaller)")
+        print(f"kept: {kept_source} sources unchanged (size guard or skipped slow path)")
     if skipped_small:
         print(f"small: {len(skipped_small)} sources below the NVENC minimum kept as-is")
     if skipped_prev_kept:
@@ -1200,6 +1282,7 @@ def main() -> None:
             "dst": str(args.dst),
             **({"interrupted": True} if interrupted else {}),
             "cq": args.cq,
+            "mid_cq": args.mid_cq,
             "auto_quality": args.auto_quality,
             "device": args.device,
             "preset": args.preset,
@@ -1214,6 +1297,7 @@ def main() -> None:
             "webp_lossless_max_mb": args.webp_lossless_max_mb,
             "opaque_format": args.opaque_format,
             "opaque_webp_quality": args.opaque_webp_quality,
+            "opaque_webp_max_mp": args.opaque_webp_max_mp,
             "oversize_format": args.oversize_format,
             "oversize_webp_quality": args.oversize_webp_quality,
             "oversize_webp_method": args.oversize_webp_method,
