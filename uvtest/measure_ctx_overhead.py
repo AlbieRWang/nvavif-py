@@ -1,22 +1,14 @@
-"""Measure the per-encode NVENC context-open overhead (OPTIMIZATION_PROPOSALS Q).
-
-Answers one question: what share of per-image wall time is the NVENC/FFmpeg
-encoder context creation (the part a persistent-encoder/session-reuse design
-could remove), and how does that share move with image size and with auto_cq
-(trial encodes add two same-size 512x512 opens per image)?
-
-Method: synthetic corpora are encoded in a worker subprocess with
-NVAVIF_DEBUG_TIMING=1; the Rust side emits one stderr line per encoder open
-(`nvenc ctx_open`) and one per finished GPU encode (`gpu encode ... total`),
-so ctx_open share of per-image wall time is measured, not estimated.
-
-Corpora (generated under uvtest/out/ctx_overhead_corpus/, never test_imgs):
-    same512  N images 512x512 JPEG      (session-reuse best case: every
-                                         image shares one dimension pair)
-    mixed    N images 256..1536 px JPEG (worst case: every open is a fresh size)
+"""Measure Python, YUV and NVENC API stages with strict GPU encoding.
 
 Usage:
-    uv run python uvtest/measure_ctx_overhead.py [--images 200] [--repeats 3]
+    uv run python uvtest/measure_ctx_overhead.py --images 12 --repeats 3
+    uv run python uvtest/measure_ctx_overhead.py --source-dir test_imgs --min-mp 8
+
+Each repeat uses a fresh process; the hardware probe is outside measured calls.
+Synthetic same512/mixed corpora isolate reuse; real sources are filtered to
+opaque, supported dimensions. All stages measure host wall time. Host-frame
+preparation is a CPU copy; send/receive include FFmpeg, driver, transfer and
+encoder work, not separately measured upload or pure NVENC execution.
 """
 
 from __future__ import annotations
@@ -25,15 +17,26 @@ import argparse
 import json
 import os
 import re
+import statistics
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 CORPUS = ROOT / "uvtest" / "out" / "ctx_overhead_corpus"
 
-CTX_RE = re.compile(r"nvenc ctx_open (\d+)x(\d+) ([\d.]+) ms")
-ENC_RE = re.compile(r"gpu encode (\d+)x(\d+) total ([\d.]+) ms")
+STAGES = ("python input", "python normalize", "yuv_build", "nvenc ctx_evict",
+          "nvenc ctx_open", "nvenc ctx_close", "nvenc host_frame",
+          "nvenc send", "nvenc receive")
+INPUT_STAGES = ("python decode", "python color_orientation", "python array")
+STAGE_RE = re.compile(
+    r"timing: (python decode|python color_orientation|python array|"
+    r"python input|python normalize|python native|yuv_build|"
+    r"nvenc host_frame|nvenc send|nvenc receive|nvenc ctx_open|"
+    r"nvenc ctx_evict|nvenc ctx_close|nvenc ctx_reuse|gpu encode) "
+    r"(\d+)x(\d+) (?:total )?([\d.]+) ms"
+)
 
 
 def generate_corpus(n: int) -> dict[str, list[Path]]:
@@ -66,82 +69,155 @@ def generate_corpus(n: int) -> dict[str, list[Path]]:
     return corpora
 
 
-def run_worker(images: list[str], mode_args: list[str]) -> tuple[dict, dict]:
-    """Encode the list in a subprocess with timing on; return (timings, stderr-aggregates)."""
-    env = dict(os.environ, NVAVIF_DEBUG_TIMING="1")
+def select_sources(directory: Path, n: int, min_mp: float) -> tuple[list[Path], list[dict]]:
+    from PIL import Image, ImageOps
+
+    selected, excluded = [], []
+    for path in sorted(directory.rglob("*")):
+        if path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}:
+            continue
+        try:
+            with Image.open(path) as source:
+                w, h = source.size
+                reason = None
+                if getattr(source, "is_animated", False):
+                    reason = "animated"
+                elif max(w, h) > 8192 or min(w, h) < 130:
+                    reason = "dimensions"
+                elif w * h <= min_mp * 1e6:
+                    reason = "below_min_mp"
+                elif "A" in source.getbands() or "transparency" in source.info:
+                    with ImageOps.exif_transpose(source).convert("RGBA") as rgba:
+                        if rgba.getchannel("A").getextrema() != (255, 255):
+                            reason = "transparent"
+                if reason:
+                    excluded.append({"path": str(path), "reason": reason})
+                else:
+                    selected.append(path)
+        except Exception as exc:
+            excluded.append({"path": str(path), "reason": str(exc)})
+    return selected[:n], excluded
+
+
+def run_worker(images: list[str], mode_args: list[dict], capacity: int) -> dict:
+    env = dict(os.environ, NVAVIF_DEBUG_TIMING="1", NVAVIF_CTX_CACHE=str(capacity))
     payload = json.dumps({"images": images, "mode_args": mode_args})
+    begin = time.perf_counter()
     proc = subprocess.run(
-        [sys.executable, __file__, "--worker"],
-        input=payload,
-        capture_output=True,
-        text=True,
-        env=env,
-        cwd=str(ROOT),
+        [sys.executable, __file__, "--worker"], input=payload,
+        capture_output=True, text=True, env=env, cwd=str(ROOT),
     )
+    process_ms = (time.perf_counter() - begin) * 1e3
     if proc.returncode != 0:
-        sys.exit(f"worker failed:\n{proc.stderr[-2000:]}")
-    timings = json.loads(proc.stdout)
-    opens = [float(m.group(3)) for line in proc.stderr.splitlines() if (m := CTX_RE.search(line))]
-    encs = [float(m.group(3)) for line in proc.stderr.splitlines() if (m := ENC_RE.search(line))]
-    return timings, {"opens": opens, "enc_total_ms": encs}
+        sys.exit(f"worker failed:\n{proc.stderr[-4000:]}")
+    result = json.loads(proc.stdout)
+    events = [dict(stage=m[1], width=int(m[2]), height=int(m[3]), ms=float(m[4]))
+              for m in STAGE_RE.finditer(proc.stderr)]
+    counts = {stage: sum(e["stage"] == stage for e in events)
+              for stage in (*STAGES, *INPUT_STAGES, "python native", "nvenc ctx_reuse")}
+    frame_count = counts["nvenc ctx_open"] + counts["nvenc ctx_reuse"]
+    if (any(counts[s] != len(images) for s in
+            ("python input", "python normalize", "python native", "yuv_build", *INPUT_STAGES))
+            or any(counts[s] != frame_count for s in
+                   ("nvenc host_frame", "nvenc send", "nvenc receive"))):
+        sys.exit("Incomplete stage timings; rebuild and reinstall the current wheel first")
+    result.update(process_ms=process_ms, events=events, stderr=proc.stderr, counts=counts)
+    return result
 
 
-def median(vals: list[float]) -> float:
-    s = sorted(vals)
-    return s[len(s) // 2] if s else 0.0
+def summarize(runs: list[dict], n: int) -> dict:
+    stages = {s: statistics.median(
+        sum(e["ms"] for e in run["events"] if e["stage"] == s) / n for run in runs
+    ) for s in STAGES}
+    native_other = statistics.median(
+        (sum(e["ms"] for e in run["events"] if e["stage"] == "python native")
+         - sum(e["ms"] for e in run["events"] if e["stage"] in STAGES[2:])) / n
+        for run in runs
+    )
+    misses = statistics.median(run["counts"]["nvenc ctx_open"] for run in runs)
+    hits = statistics.median(run["counts"]["nvenc ctx_reuse"] for run in runs)
+    return {"wall_ms_per_image": statistics.median(
+                sum(run["per_image_ms"]) / n for run in runs),
+            "stages_ms_per_image": stages,
+            "input_breakdown_ms_per_image": {s: statistics.median(
+                sum(e["ms"] for e in run["events"] if e["stage"] == s) / n for run in runs
+            ) for s in INPUT_STAGES},
+            "native_other_ms_per_image": native_other,
+            "context_opens": misses, "context_hits": hits,
+            "context_hit_pct": 100 * hits / (hits + misses) if hits + misses else 0,
+            "loop_ms": statistics.median(run["loop_ms"] for run in runs),
+            "process_ms": statistics.median(run["process_ms"] for run in runs)}
 
 
 def main() -> None:
     if "--worker" in sys.argv:
         payload = json.loads(sys.stdin.read())
-        import time
-
         import nvavif_py as nv
 
+        os.environ["NVAVIF_DEBUG_TIMING"] = "0"
+        if not nv.is_supported():
+            raise RuntimeError("NVENC AV1 unavailable; CPU fallback is disabled")
+        os.environ["NVAVIF_DEBUG_TIMING"] = "1"
         kwargs: dict = {}
         for kv in payload["mode_args"]:
             kwargs.update(kv)
-        per_image = []
+        per_image, sizes = [], []
+        started = time.perf_counter()
         for p in payload["images"]:
             t0 = time.perf_counter()
-            nv.encode_file(p, **kwargs)
-            per_image.append(round(time.perf_counter() - t0, 4))
-        print(json.dumps({"per_image_ms": [v * 1e3 for v in per_image]}))
+            data = nv.encode_file(p, device="gpu", **kwargs)
+            per_image.append((time.perf_counter() - t0) * 1e3)
+            sizes.append(len(data))
+        print(json.dumps({"per_image_ms": per_image, "output_bytes": sizes,
+                          "paths": payload["images"], "module": nv.__file__,
+                          "loop_ms": (time.perf_counter() - started) * 1e3}))
         return
 
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--images", type=int, default=200)
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--images", type=int, default=12)
     ap.add_argument("--repeats", type=int, default=3)
+    ap.add_argument("--cache", type=int, default=1)
+    ap.add_argument("--source-dir", type=Path)
+    ap.add_argument("--min-mp", type=float, default=8)
+    ap.add_argument("--auto-cq", action="store_true")
     args = ap.parse_args()
+    if args.images < 1 or args.repeats < 1 or args.cache < 0 or args.min_mp < 0:
+        ap.error("images/repeats must be positive and cache/min-mp nonnegative")
+    excluded = []
+    if args.source_dir:
+        if not args.source_dir.is_dir():
+            ap.error("source-dir must be an existing directory")
+        paths, excluded = select_sources(args.source_dir, args.images, args.min_mp)
+        if not paths:
+            ap.error("no eligible opaque images")
+        corpora = {"sources": paths}
+    else:
+        corpora = generate_corpus(args.images)
+    modes = {"cq20": [{"cq": 20}]}
+    if args.auto_cq:
+        modes["auto_cq90"] = [{"auto_cq": True, "target_quality": 90}]
 
-    corpora = generate_corpus(args.images)
-    modes = {
-        "cq20": [{"cq": 20}],
-        "auto_cq90": [{"auto_cq": True, "target_quality": 90}],
-    }
-
-    print(f"corpus: {args.images} images per variant, {args.repeats} repeats (median)\n")
-    header = f"{'variant/mode':<18}{'img_ms':>9}{'open/img':>10}{'open_ms/img':>13}{'open share':>12}{'enc_ms/img':>12}"
-    print(header)
-    results = {}
+    report = {"settings": vars(args) | {"source_dir": str(args.source_dir)},
+              "excluded": excluded, "variants": {}}
+    CORPUS.mkdir(parents=True, exist_ok=True)
+    out = CORPUS / f"stages_{time.time_ns()}.json"
     for name, paths in corpora.items():
         for mode, kwargs in modes.items():
-            runs = []
-            for _ in range(args.repeats):
-                timings, agg = run_worker([str(p) for p in paths], kwargs)
-                runs.append((timings, agg))
-            # Median over repeats of the per-run means (per-image wall is noisy)
-            img_ms = median([sum(t["per_image_ms"]) / len(t["per_image_ms"]) for t, _ in runs])
-            open_cnt = median([len(a["opens"]) / len(paths) for _, a in runs])
-            open_ms = median([sum(a["opens"]) / len(paths) for _, a in runs])
-            enc_ms = median([sum(a["enc_total_ms"]) / len(paths) for _, a in runs])
-            share = open_ms / img_ms * 100 if img_ms else 0
-            results[f"{name}/{mode}"] = {"img_ms": img_ms, "open_per_img": open_cnt, "open_ms": open_ms, "share_pct": share, "enc_ms": enc_ms}
-            print(f"{name}/{mode:<12}{img_ms:>9.1f}{open_cnt:>10.2f}{open_ms:>13.2f}{share:>11.1f}%{enc_ms:>12.1f}")
-
-    out = CORPUS / "results.json"
-    out.write_text(json.dumps(results, indent=1), encoding="utf-8")
-    print(f"\nresults: {out}")
+            runs = [run_worker([str(p.resolve()) for p in paths], kwargs, args.cache)
+                    for _ in range(args.repeats)]
+            summary = summarize(runs, len(paths))
+            report["variants"][f"{name}/{mode}"] = {
+                "images": len(paths), "summary": summary, "runs": runs}
+            out.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+            print(f"{name}/{mode}: {len(paths)} images, {summary['wall_ms_per_image']:.2f} ms/image, "
+                  f"context hits {summary['context_hit_pct']:.1f}%", flush=True)
+            for stage, ms in summary["stages_ms_per_image"].items():
+                print(f"  {stage:<20} {ms:9.2f} ms/image")
+            print(f"  {'native other':<20} {summary['native_other_ms_per_image']:9.2f} ms/image")
+            print("  Within python input (already included above):")
+            for stage, ms in summary["input_breakdown_ms_per_image"].items():
+                print(f"    {stage:<26} {ms:9.2f} ms/image")
+    print(f"Report: {out.relative_to(ROOT)}")
 
 
 if __name__ == "__main__":

@@ -754,6 +754,7 @@ fn stream_gpu_frame(
     height: usize,
     data: &YuvData,
 ) -> PyResult<Vec<u8>> {
+    let t_prepare = std::time::Instant::now();
     let mut frame = Video::empty();
     unsafe {
         frame.alloc(data.pixel_format, width as u32, height as u32);
@@ -784,10 +785,21 @@ fn stream_gpu_frame(
                 .copy_from_slice(&sources[i][y * row_size..y * row_size + row_size]);
         }
     }
+    if debug_timing_enabled() {
+        eprintln!(
+            "[nvavif_py] timing: nvenc host_frame {}x{} {:.2} ms",
+            width,
+            height,
+            t_prepare.elapsed().as_secs_f64() * 1e3
+        );
+    }
 
+    let t_send = std::time::Instant::now();
     encoder.send_frame(&frame).map_err(|e| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to send frame: {}", e))
     })?;
+    let send_ms = t_send.elapsed().as_secs_f64() * 1e3;
+    let t_receive = std::time::Instant::now();
 
     let mut packet = Packet::empty();
     let mut out = Vec::new();
@@ -795,6 +807,18 @@ fn stream_gpu_frame(
         if let Some(d) = packet.data() {
             out.extend_from_slice(d);
         }
+    }
+    if debug_timing_enabled() {
+        eprintln!(
+            "[nvavif_py] timing: nvenc send {}x{} {:.2} ms",
+            width, height, send_ms
+        );
+        eprintln!(
+            "[nvavif_py] timing: nvenc receive {}x{} {:.2} ms",
+            width,
+            height,
+            t_receive.elapsed().as_secs_f64() * 1e3
+        );
     }
 
     if out.is_empty() {
@@ -862,8 +886,18 @@ fn encode_av1_frame_gpu(
         // corpus image fail NVENC init and silently fall back to CPU
         // (1.65 s -> 70 s). With evict-first the per-worker peak is 1 session,
         // identical to the historical open/close-per-image behavior.
+        let t_evict = std::time::Instant::now();
+        let evicted = cache.len() >= capacity;
         while cache.len() >= capacity {
             cache.remove(0);
+        }
+        if evicted && debug_timing_enabled() {
+            eprintln!(
+                "[nvavif_py] timing: nvenc ctx_evict {}x{} {:.2} ms",
+                width,
+                height,
+                t_evict.elapsed().as_secs_f64() * 1e3
+            );
         }
     }
 
@@ -881,6 +915,17 @@ fn encode_av1_frame_gpu(
 
     if capacity > 0 {
         gpu_encoder_cache().push((key, encoder));
+    } else {
+        let t_close = std::time::Instant::now();
+        drop(encoder);
+        if debug_timing_enabled() {
+            eprintln!(
+                "[nvavif_py] timing: nvenc ctx_close {}x{} {:.2} ms",
+                width,
+                height,
+                t_close.elapsed().as_secs_f64() * 1e3
+            );
+        }
     }
 
     if debug_timing_enabled() {
@@ -1332,6 +1377,7 @@ fn encode_avif(
 
     // Instantiate the required reader via `bytemuck` without copying RAM
     // with maximum static optimization (Zero-Cost Abstractions)
+    let t_yuv = std::time::Instant::now();
     let (color_yuv, alpha_yuv) = match input_dtype {
         "u8" => build_yuv(
             &ReaderU8 {
@@ -1372,6 +1418,14 @@ fn encode_avif(
         ),
         _ => unreachable!(),
     };
+    if debug_timing_enabled() {
+        eprintln!(
+            "[nvavif_py] timing: yuv_build {}x{} {:.2} ms",
+            width,
+            height,
+            t_yuv.elapsed().as_secs_f64() * 1e3
+        );
+    }
 
     let bit_depth = if depth == PyColorDepth::TenBit { 10 } else { 8 };
 

@@ -1,5 +1,7 @@
 import io
 import os
+import sys
+import time
 from enum import IntEnum, Enum
 from pathlib import Path
 
@@ -66,6 +68,16 @@ class Device(str, Enum):
     CPU = 'cpu'
     AUTO = 'auto'
 
+
+def _debug_timing(label: str, width: int, height: int, started: float) -> None:
+    if os.environ.get('NVAVIF_DEBUG_TIMING') == '1':
+        print(
+            f'[nvavif_py] timing: {label} {width}x{height} '
+            f'{(time.perf_counter() - started) * 1e3:.2f} ms',
+            file=sys.stderr,
+        )
+
+
 def is_supported() -> bool:
     """
     Checks if the current system supports AV1 hardware encoding.
@@ -82,20 +94,79 @@ def is_supported() -> bool:
         return False
 
 
+_SRGB_IDENTITY_PROBE: Image.Image | None = None
+# Distinct ICC blobs -> is the transform to sRGB effectively identity on the probe.
+_ICC_IDENTITY_CACHE: dict[bytes, bool] = {}
+
+
+def _identity_probe() -> Image.Image:
+    """A dense, tiny RGB sample: a 16x16x16 colour cube plus all 256 greys."""
+    global _SRGB_IDENTITY_PROBE
+    if _SRGB_IDENTITY_PROBE is None:
+        levels = np.arange(16, dtype=np.uint8) * 17
+        cube = np.array(np.meshgrid(levels, levels, levels, indexing='ij')).reshape(3, -1).T
+        greys = np.stack([np.arange(256, dtype=np.uint8)] * 3, axis=1)
+        rgb = np.concatenate([cube, greys], axis=0).reshape(-1, 1, 3)
+        _SRGB_IDENTITY_PROBE = Image.fromarray(rgb, 'RGB')
+    return _SRGB_IDENTITY_PROBE
+
+
+def _is_srgb_identity(icc: bytes, srgb_profile) -> bool:
+    """True when transforming ``icc`` to sRGB leaves the probed colours unchanged
+    up to 1 LSB.
+
+    Most embedded profiles are sRGB variants, for which the conversion rewrites
+    a full-resolution image without meaningfully changing any pixel (measured:
+    ~158 ms on a 20 MP JPEG, roughly a fifth of the encode call). lcms pipes
+    8-bit samples through a 16-bit PCS, so even a true sRGB variant lands 1 LSB
+    off on a handful of probe samples (measured: 32 of 13056); a real
+    colour-space change moves samples by far more (36 for Adobe-RGB primaries,
+    116 for the Skia profile seen in the corpus). Accepting that rounding as
+    identity lets the full-size copy be skipped. Detecting the case on a dense
+    probe — once per distinct profile — costs under a millisecond. Detection is
+    conservative: an unbuildable or unexpected transform reports False, so those
+    images keep the convert-everything behaviour.
+    """
+    cached = _ICC_IDENTITY_CACHE.get(icc)
+    if cached is not None:
+        return cached
+    result = False
+    try:
+        src_profile = ImageCms.ImageCmsProfile(io.BytesIO(icc))
+        transform = ImageCms.buildTransformFromOpenProfiles(
+            src_profile, srgb_profile, 'RGB', 'RGB'
+        )
+        probe = _identity_probe()
+        converted = ImageCms.applyTransform(probe, transform)
+        before = np.frombuffer(probe.tobytes(), np.uint8).astype(np.int16)
+        after = np.frombuffer(converted.tobytes(), np.uint8).astype(np.int16)
+        result = int(np.abs(before - after).max()) <= 1
+    except Exception as exc:
+        result = False
+        if os.environ.get('NVAVIF_DEBUG_TIMING') == '1':
+            print(
+                f'[nvavif_py] timing: icc_identity_probe failed ({exc}); converting as before',
+                file=sys.stderr,
+            )
+    _ICC_IDENTITY_CACHE[icc] = result
+    return result
+
+
 def _ensure_srgb(img: Image.Image) -> Image.Image:
     """
     Converts the input image to the sRGB color space if an embedded ICC profile is present.
 
     If the image contains color profile metadata, it uses ImageCms to perform a transformation
-    from the source profile to a standard sRGB profile. If no profile is found, the
-    original image is returned without modification.
+    from the source profile to a standard sRGB profile. A profile whose transform to sRGB is
+    an exact identity (the common sRGB variants) is left as-is instead of being rewritten.
+    If no profile is found, the original image is returned without modification.
 
     Args:
         img (Image.Image): PIL image instance to be checked and potentially converted.
 
     Returns:
         Image.Image: image transformed to the sRGB color space or the original image
-        if no ICC profile was detected.
+        if no ICC profile was detected or the profile already is sRGB.
 
     Raises:
         PyCMSError: if the color profile conversion fails due to invalid or corrupt ICC data.
@@ -103,8 +174,13 @@ def _ensure_srgb(img: Image.Image) -> Image.Image:
     icc = img.info.get('icc_profile')
     if icc:
         try:
+            icc = bytes(icc)
+            # createProfile returns the raw lcms handle; ImageCms.buildTransform*
+            # (unlike profileToProfile) expects the ImageCmsProfile wrapper.
+            srgb_profile = ImageCms.ImageCmsProfile(ImageCms.createProfile('sRGB'))
+            if _is_srgb_identity(icc, srgb_profile):
+                return img
             src_profile = ImageCms.ImageCmsProfile(io.BytesIO(icc))
-            srgb_profile = ImageCms.createProfile('sRGB')
             return ImageCms.profileToProfile(img, src_profile, srgb_profile)
         except Exception:
             pass
@@ -279,6 +355,7 @@ def encode_file(
         TypeError: If the `input_source` type is not supported.
         ValueError: If the input numpy array is not three-dimensional (H, W, C).
     """
+    t_input = time.perf_counter()
     # Seamless support for PyTorch and CuPy (auto-migration from GPU to CPU)
     if hasattr(input_source, '__cuda_array_interface__') or (hasattr(input_source, 'device') and hasattr(input_source, 'cpu')):
         if hasattr(input_source, 'detach'):  # PyTorch Tensor
@@ -295,6 +372,8 @@ def encode_file(
 
     # Convert any input to a numpy array
     exif_orientation_applied = False
+    # Set when PIL's packed 8-bit RGB buffer can be handed to Rust unchanged.
+    _flat_rgb: bytes | None = None
     if isinstance(input_source, np.ndarray):
         img_array = input_source
     else:
@@ -310,8 +389,17 @@ def encode_file(
             raise TypeError(f'Unsupported input type: {type(input_source)}')
 
         try:
+            if os.environ.get('NVAVIF_DEBUG_TIMING') == '1':
+                t_decode = time.perf_counter()
+                img.load()
+                _debug_timing('python decode', img.width, img.height, t_decode)
+            t_color = time.perf_counter()
             img = _ensure_srgb(img)
-            img = ImageOps.exif_transpose(img)
+            # Orientation 1 (or absent) needs no transpose, and exif_transpose
+            # still returns a full-resolution copy in that case — pure waste
+            # (measured ~17 ms on a 36 MP JPEG).
+            if img.getexif().get(_ORIENTATION_TAG, 1) != 1:
+                img = ImageOps.exif_transpose(img)
             exif_orientation_applied = True
 
             if img.mode == 'P':
@@ -322,8 +410,23 @@ def encode_file(
                 img = img.convert('RGBA')
             elif img.mode not in ('RGB', 'RGBA'):
                 img = img.convert('RGBA' if getattr(img, 'has_alpha', False) else 'RGB')
+            _debug_timing('python color_orientation', img.width, img.height, t_color)
 
-            img_array = np.array(img)
+            t_array = time.perf_counter()
+            # PIL stores 8-bit RGB tightly packed and the encoder consumes
+            # exactly those bytes: for even-sized RGB, hand the buffer straight
+            # over instead of paying np.array's two copies (~43 ms on 36 MP)
+            # plus another copy for tobytes. The read-only view below only
+            # feeds the shape/alpha/dtype checks. Other modes and odd sizes
+            # keep the numpy path, which handles alpha and the 1px crop.
+            if img.mode == 'RGB' and img.width % 2 == 0 and img.height % 2 == 0:
+                _flat_rgb = img.tobytes()
+                img_array = np.frombuffer(_flat_rgb, np.uint8).reshape(
+                    img.height, img.width, 3
+                )
+            else:
+                img_array = np.array(img)
+            _debug_timing('python array', img.width, img.height, t_array)
         finally:
             if is_opened_here and hasattr(img, 'close'):
                 img.close()
@@ -331,6 +434,8 @@ def encode_file(
     # Check dimensions (H, W, C)
     if len(img_array.shape) != 3:
         raise ValueError('Image must be a three-dimensional array (H, W, C)')
+    _debug_timing('python input', img_array.shape[1], img_array.shape[0], t_input)
+    t_normalize = time.perf_counter()
 
     if img_array.shape[2] == 4:
         alpha = img_array[:, :, 3]
@@ -388,9 +493,12 @@ def encode_file(
     # pass (e.g. img.info["exif"], or Exif.tobytes() from the Pillow plugin).
     exif = _normalize_exif_payload(exif, drop_orientation=exif_orientation_applied)
 
+    pixels = _flat_rgb if _flat_rgb is not None else img_array.tobytes()
+    _debug_timing('python normalize', w, h, t_normalize)
+    t_native = time.perf_counter()
     # Call Rust function; the binding returns (bitstream, effective color CQ)
     data, chosen_cq = encode_avif(
-        pixels=img_array.tobytes(),
+        pixels=pixels,
         width=w,
         height=h,
         input_dtype=dtype_str,
@@ -406,6 +514,7 @@ def encode_file(
         device=device,
         tone_map=tone_map
     )
+    _debug_timing('python native', w, h, t_native)
     if with_cq:
         return data, chosen_cq
     return data
